@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import api from '../config/api'
 import {
   Upload, Files, Loader2, CheckCircle, XCircle, Clock, Trash2, Download,
-  Eye, AlertTriangle, Sparkles, ClipboardList, MessageSquare, Archive
+  Eye, Sparkles, ClipboardList, Archive, PanelRightOpen, Users, ShieldAlert,
+  Target, ListChecks, StickyNote, Check, AlertCircle, ChevronDown, ChevronUp
 } from 'lucide-react'
 
 const STATUS_MAP = {
@@ -14,25 +15,33 @@ const STATUS_MAP = {
 }
 
 const WORKFLOW_MAP = {
-  new: { label: '未处理', color: 'bg-slate-100 text-slate-700' },
-  shortlisted: { label: '待面试', color: 'bg-emerald-100 text-emerald-700' },
-  needs_review: { label: '待复核', color: 'bg-amber-100 text-amber-700' },
-  rejected: { label: '已淘汰', color: 'bg-red-100 text-red-700' },
-  archived: { label: '已入库', color: 'bg-blue-100 text-blue-700' },
+  new: { label: '未处理', color: 'bg-slate-100 text-slate-700', dot: 'bg-slate-400' },
+  shortlisted: { label: '待面试', color: 'bg-emerald-100 text-emerald-700', dot: 'bg-emerald-500' },
+  needs_review: { label: '待复核', color: 'bg-amber-100 text-amber-700', dot: 'bg-amber-500' },
+  rejected: { label: '已淘汰', color: 'bg-red-100 text-red-700', dot: 'bg-red-500' },
+  archived: { label: '已入库', color: 'bg-blue-100 text-blue-700', dot: 'bg-blue-500' },
 }
 
 const RISK_MAP = {
-  low: { label: '低风险', color: 'bg-emerald-100 text-emerald-700' },
-  medium: { label: '中风险', color: 'bg-amber-100 text-amber-700' },
-  high: { label: '高风险', color: 'bg-red-100 text-red-700' },
+  low: { label: '低风险', color: 'bg-emerald-50 text-emerald-700 border-emerald-200', rail: 'bg-emerald-500' },
+  medium: { label: '中风险', color: 'bg-amber-50 text-amber-700 border-amber-200', rail: 'bg-amber-500' },
+  high: { label: '高风险', color: 'bg-red-50 text-red-700 border-red-200', rail: 'bg-red-500' },
 }
 
-const FILTERS = [
-  { key: '', label: '全部候选人' },
-  { key: 'high_score', label: '高分候选人' },
-  { key: 'high_risk', label: '高风险候选人' },
-  { key: 'missing_info', label: '信息不完整' },
-  { key: 'needs_review', label: '待人工复核' },
+const RECOMMENDATION_MAP = {
+  推荐面试: { color: 'bg-emerald-600 text-white', soft: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  待定: { color: 'bg-slate-700 text-white', soft: 'bg-slate-100 text-slate-700 border-slate-200' },
+  建议人工复核: { color: 'bg-amber-500 text-white', soft: 'bg-amber-50 text-amber-700 border-amber-200' },
+  建议淘汰: { color: 'bg-red-600 text-white', soft: 'bg-red-50 text-red-700 border-red-200' },
+}
+
+const QUEUES = [
+  { key: '', label: '全部', description: '完整候选池' },
+  { key: 'recommended', label: '推荐面试', description: '优先约面' },
+  { key: 'needs_review', label: '待复核', description: '需要人工确认' },
+  { key: 'high_risk', label: '高风险', description: '证据链优先' },
+  { key: 'missing_info', label: '信息缺失', description: '资料不完整' },
+  { key: 'handled', label: '已处理', description: '完成流转' },
 ]
 
 function GradeBadge({ grade }) {
@@ -65,7 +74,7 @@ function getConcerns(resume) {
 }
 
 function sortResumes(list) {
-  const rank = { 推荐面试: 0, 待定: 1, 建议人工复核: 2, 建议淘汰: 3 }
+  const rank = { 推荐面试: 0, 待定: 1, 建议人工复核: 2, 建议淘汰: 3, '-': 8 }
   return [...list].sort((a, b) => {
     const ar = rank[getRecommendation(a)] ?? 9
     const br = rank[getRecommendation(b)] ?? 9
@@ -74,16 +83,43 @@ function sortResumes(list) {
   })
 }
 
+function isMissingInfo(resume) {
+  const concerns = getConcerns(resume).join('')
+  const name = resume.candidateName || ''
+  return /信息缺失|联系方式|邮箱|电话|学历|年龄/.test(concerns) || /^简历 #/.test(name)
+}
+
+function EmptyQueue({ queue }) {
+  const copy = {
+    recommended: '暂无推荐面试候选人，建议调整 JD、降低初筛阈值，或先查看“待定”队列。',
+    needs_review: '当前没有待复核候选人，很清爽。高风险或模型超时会自动进入这里。',
+    high_risk: '暂无高风险候选人。风险证据会在报告页里展开。',
+    missing_info: '暂无明显信息缺失候选人。联系方式、学历、年龄等缺口会被归到这里。',
+    handled: '暂无已处理候选人。把候选人标记为待面试、已淘汰或已入库后会出现在这里。',
+  }
+  return (
+    <div className="flex flex-col items-center justify-center py-16 text-center text-slate-400">
+      <Files className="w-12 h-12 mb-3 text-slate-300" />
+      <p className="font-medium text-slate-600">这个队列暂时为空</p>
+      <p className="text-sm mt-1 max-w-md">{copy[queue] || '上传简历后，系统会自动按推荐动作和匹配分生成候选人决策队列。'}</p>
+    </div>
+  )
+}
+
 export default function BatchReviewPage() {
   const [resumes, setResumes] = useState([])
   const [profiles, setProfiles] = useState([])
   const [selectedProfile, setSelectedProfile] = useState('')
-  const [filter, setFilter] = useState('')
+  const [queue, setQueue] = useState('')
   const [selectedIds, setSelectedIds] = useState([])
+  const [activeResumeId, setActiveResumeId] = useState(null)
   const [loading, setLoading] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [selectedFileCount, setSelectedFileCount] = useState(0)
   const [jobDescription, setJobDescription] = useState('')
+  const [uploadOpen, setUploadOpen] = useState(false)
+  const [saveState, setSaveState] = useState({})
+  const [noteDraft, setNoteDraft] = useState('')
   const [error, setError] = useState('')
   const fileRef = useRef(null)
   const navigate = useNavigate()
@@ -135,6 +171,7 @@ export default function BatchReviewPage() {
       await api.post('/batch-upload', formData)
       fileRef.current.value = ''
       setSelectedFileCount(0)
+      setUploadOpen(false)
       await loadResumes()
     } catch (err) {
       setError(err.response?.data?.error || '批量上传失败')
@@ -175,11 +212,15 @@ export default function BatchReviewPage() {
 
   const updateWorkflow = async (resume, workflowStatus, hrNote = resume.hrNote || '') => {
     const previous = resumes
+    setSaveState({ id: resume.id, status: 'saving' })
     setResumes(list => list.map(r => r.id === resume.id ? { ...r, workflowStatus, hrNote } : r))
     try {
       await api.put(`/resumes/${resume.id}/workflow`, { workflowStatus, hrNote })
+      setSaveState({ id: resume.id, status: 'saved' })
+      setTimeout(() => setSaveState(current => current.id === resume.id ? {} : current), 1400)
     } catch (err) {
       setResumes(previous)
+      setSaveState({ id: resume.id, status: 'error' })
       setError(err.response?.data?.error || '更新处理状态失败')
     }
   }
@@ -194,138 +235,287 @@ export default function BatchReviewPage() {
     else setSelectedIds(ids)
   }
 
-  const filteredResumes = sortResumes(resumes.filter(r => {
+  const applyQueue = (list, key) => list.filter(r => {
     const score = getMatchScore(r) || 0
     const risk = getRiskLevel(r)
-    const concerns = getConcerns(r).join('')
-    if (filter === 'high_score') return score >= 75
-    if (filter === 'high_risk') return risk === 'high'
-    if (filter === 'missing_info') return /信息缺失|联系方式|邮箱|电话|学历|年龄/.test(concerns)
-    if (filter === 'needs_review') return r.workflowStatus === 'needs_review' || getRecommendation(r) === '建议人工复核'
+    const recommendation = getRecommendation(r)
+    const handled = ['shortlisted', 'rejected', 'archived'].includes(r.workflowStatus)
+    if (key === 'recommended') return recommendation === '推荐面试' || score >= 75
+    if (key === 'needs_review') return r.workflowStatus === 'needs_review' || recommendation === '建议人工复核'
+    if (key === 'high_risk') return risk === 'high'
+    if (key === 'missing_info') return isMissingInfo(r)
+    if (key === 'handled') return handled
     return true
-  }))
+  })
+
+  const filteredResumes = sortResumes(applyQueue(resumes, queue))
+  const activeResume = filteredResumes.find(r => r.id === activeResumeId) || filteredResumes[0] || null
+
+  useEffect(() => {
+    if (!activeResume) {
+      setNoteDraft('')
+      return
+    }
+    if (activeResumeId !== activeResume.id) setActiveResumeId(activeResume.id)
+    setNoteDraft(activeResume.hrNote || '')
+  }, [activeResume?.id, activeResume?.hrNote])
 
   const completed = resumes.filter(r => r.status === 'completed')
-  const recommended = completed.filter(r => getRecommendation(r) === '推荐面试').length
-  const needsReview = resumes.filter(r => r.workflowStatus === 'needs_review' || getRiskLevel(r) === 'high').length
+  const recommended = completed.filter(r => getRecommendation(r) === '推荐面试' || (getMatchScore(r) || 0) >= 75).length
+  const needsReview = resumes.filter(r => r.workflowStatus === 'needs_review' || getRecommendation(r) === '建议人工复核').length
+  const highRisk = resumes.filter(r => getRiskLevel(r) === 'high').length
   const avgMatch = completed.length ? Math.round(completed.reduce((sum, r) => sum + (getMatchScore(r) || 0), 0) / completed.length) : 0
 
+  const queueCounts = Object.fromEntries(QUEUES.map(item => [item.key, applyQueue(resumes, item.key).length]))
+  const selectedCount = selectedIds.length
+
   return (
-    <div className="max-w-7xl mx-auto">
-      <div className="mb-6">
-        <p className="text-sm font-medium text-cyan-600 mb-1">AI 招聘初筛工作台</p>
-        <h2 className="text-2xl font-bold text-slate-900">5分钟完成批量筛选、风险识别和面试建议</h2>
+    <div className="screening-console mx-auto max-w-[1500px]">
+      <div className="mb-5 flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
+        <div>
+          <p className="text-sm font-semibold tracking-wide text-cyan-700">AI 招聘初筛工作台</p>
+          <h2 className="mt-1 text-2xl font-black text-slate-950 md:text-3xl">今日初筛指挥区</h2>
+          <p className="mt-2 text-sm text-slate-500">先看队列，再处理候选人。绿色约面，黄色复核，红色风险，蓝色入库。</p>
+        </div>
+        <button onClick={() => setUploadOpen(v => !v)} className="inline-flex items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-slate-800">
+          <Sparkles className="h-4 w-4" /> 新建初筛任务 {uploadOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+        </button>
       </div>
 
-      {error && <div className="bg-red-50 text-red-700 px-4 py-2 rounded-lg mb-4 text-sm">{error}</div>}
+      {error && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">{error}</div>}
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-        <div className="bg-white rounded-xl border border-slate-200 p-4"><p className="text-sm text-slate-500">候选人总数</p><p className="text-2xl font-bold text-slate-900">{resumes.length}</p></div>
-        <div className="bg-white rounded-xl border border-slate-200 p-4"><p className="text-sm text-slate-500">推荐面试</p><p className="text-2xl font-bold text-emerald-600">{recommended}</p></div>
-        <div className="bg-white rounded-xl border border-slate-200 p-4"><p className="text-sm text-slate-500">待人工复核</p><p className="text-2xl font-bold text-amber-600">{needsReview}</p></div>
-        <div className="bg-white rounded-xl border border-slate-200 p-4"><p className="text-sm text-slate-500">平均匹配分</p><p className="text-2xl font-bold text-indigo-600">{avgMatch || '-'}</p></div>
+      <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+        <MetricCard icon={Users} label="候选人总数" value={resumes.length} tone="slate" />
+        <MetricCard icon={Target} label="推荐面试" value={recommended} tone="emerald" />
+        <MetricCard icon={ListChecks} label="待人工复核" value={needsReview} tone="amber" />
+        <MetricCard icon={ShieldAlert} label="高风险" value={highRisk} tone="red" />
+        <MetricCard icon={ClipboardList} label="平均匹配分" value={avgMatch || '-'} tone="indigo" />
       </div>
 
-      <div className="bg-white rounded-xl border border-slate-200 p-6 mb-6">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">审查模板</label>
-            <select value={selectedProfile} onChange={e => setSelectedProfile(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-300 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 outline-none">
-              <option value="">选择模板...</option>
-              {profiles.map(p => <option key={p.id} value={p.id}>{p.name} {p.isDefault ? '(默认)' : ''}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">上传简历</label>
-            <div onClick={() => fileRef.current?.click()} className="w-full px-3 py-2 rounded-lg border border-slate-300 hover:border-indigo-400 cursor-pointer flex items-center gap-2 text-slate-600">
-              <Upload className="w-4 h-4" />
-              <span>{selectedFileCount > 0 ? `已选择 ${selectedFileCount} 个文件` : '选择多个 docx/pdf 文件'}</span>
+      {uploadOpen && (
+        <div className="mb-5 rounded-2xl border border-slate-200 bg-white/90 p-5 shadow-sm">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_1fr_auto]">
+            <div>
+              <label className="mb-1 block text-sm font-semibold text-slate-700">审查模板</label>
+              <select value={selectedProfile} onChange={e => setSelectedProfile(e.target.value)} className="w-full rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100">
+                <option value="">选择模板...</option>
+                {profiles.map(p => <option key={p.id} value={p.id}>{p.name} {p.isDefault ? '(默认)' : ''}</option>)}
+              </select>
             </div>
-            <input ref={fileRef} type="file" accept=".docx,.pdf" multiple onChange={(e) => setSelectedFileCount(e.target.files?.length || 0)} className="hidden" />
+            <div>
+              <label className="mb-1 block text-sm font-semibold text-slate-700">上传简历</label>
+              <div onClick={() => fileRef.current?.click()} className="flex cursor-pointer items-center gap-2 rounded-xl border border-dashed border-slate-300 px-3 py-2 text-slate-600 hover:border-indigo-400 hover:bg-indigo-50/40">
+                <Upload className="h-4 w-4" />
+                <span>{selectedFileCount > 0 ? `已选择 ${selectedFileCount} 个文件` : '选择多个 docx/pdf 文件'}</span>
+              </div>
+              <input ref={fileRef} type="file" accept=".docx,.pdf" multiple onChange={(e) => setSelectedFileCount(e.target.files?.length || 0)} className="hidden" />
+            </div>
+            <div className="flex items-end">
+              <button onClick={handleUpload} disabled={uploading} className="w-full rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50 lg:w-auto">
+                {uploading ? '上传中...' : '上传并自动初筛'}
+              </button>
+            </div>
           </div>
-          <div className="flex items-end">
-            <button onClick={handleUpload} disabled={uploading} className="w-full px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium disabled:opacity-50 flex items-center justify-center gap-2">
-              {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-              上传并自动初筛
-            </button>
-          </div>
+          <label className="mb-1 mt-4 block text-sm font-semibold text-slate-700">岗位需求/JD</label>
+          <textarea value={jobDescription} onChange={e => setJobDescription(e.target.value)} rows={3} placeholder="粘贴岗位职责、必备技能、加分项、薪资范围等。未填写时按通用模板评估。" className="w-full resize-none rounded-xl border border-slate-300 px-3 py-2 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100" />
         </div>
-        <label className="block text-sm font-medium text-slate-700 mb-1">岗位需求/JD（推荐粘贴，评分会按JD匹配度排序）</label>
-        <textarea value={jobDescription} onChange={e => setJobDescription(e.target.value)} rows={4} placeholder="粘贴岗位职责、必备技能、加分项、薪资范围等。未填写时按通用模板评估。" className="w-full px-3 py-2 rounded-lg border border-slate-300 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 outline-none resize-none" />
-      </div>
+      )}
 
-      <div className="bg-white rounded-xl border border-slate-200 p-6">
-        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3 mb-4">
-          <div className="flex items-center gap-3 flex-wrap">
-            <h3 className="font-bold text-slate-800 flex items-center gap-2"><ClipboardList className="w-5 h-5 text-indigo-500" /> 候选人排行榜</h3>
-            {FILTERS.map(item => (
-              <button key={item.key} onClick={() => setFilter(item.key)} className={`px-3 py-1.5 rounded-full text-sm font-medium ${filter === item.key ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>{item.label}</button>
-            ))}
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <section className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+          <div className="border-b border-slate-200 p-4">
+            <div className="flex flex-col gap-3 2xl:flex-row 2xl:items-center 2xl:justify-between">
+              <div>
+                <h3 className="flex items-center gap-2 font-bold text-slate-900"><ClipboardList className="h-5 w-5 text-indigo-500" /> 候选人决策看板</h3>
+                <p className="mt-1 text-xs text-slate-500">默认按建议动作和匹配分排序，点击候选人查看右侧详情。</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {QUEUES.map(item => (
+                  <button key={item.key} onClick={() => setQueue(item.key)} className={`rounded-full px-3 py-1.5 text-sm font-semibold transition ${queue === item.key ? 'bg-slate-950 text-white shadow-sm' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>
+                    {item.label} <span className="ml-1 opacity-70">{queueCounts[item.key] || 0}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
-          <div className="flex gap-2">
-            <button onClick={handleBatchDelete} disabled={selectedIds.length === 0 || loading} className="px-3 py-1.5 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-medium disabled:opacity-50 flex items-center gap-1"><Trash2 className="w-4 h-4" /> 删除</button>
-            <button onClick={handleExport} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-medium flex items-center gap-1"><Download className="w-4 h-4" /> 导出Excel</button>
-          </div>
-        </div>
 
-        {loading && resumes.length === 0 ? (
-          <div className="flex items-center justify-center py-12 text-slate-400"><Loader2 className="w-6 h-6 animate-spin mr-2" /> 加载中...</div>
-        ) : filteredResumes.length === 0 ? (
-          <div className="text-center py-12 text-slate-400"><Files className="w-12 h-12 mx-auto mb-3 text-slate-300" /><p>暂无候选人数据</p></div>
-        ) : (
-          <div className="overflow-auto">
-            <table className="w-full text-sm min-w-[1180px]">
-              <thead>
-                <tr className="border-b border-slate-200 bg-slate-50">
-                  <th className="py-3 px-3 text-left"><input type="checkbox" checked={selectedIds.length === filteredResumes.length && filteredResumes.length > 0} onChange={toggleAll} /></th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">候选人</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">目标岗位</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">匹配分</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">风险等级</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">核心亮点</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">主要短板</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">建议动作</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">处理状态</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">HR备注</th>
-                  <th className="py-3 px-3 text-left font-medium text-slate-600">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredResumes.map(r => {
-                  const stInfo = STATUS_MAP[r.status] || STATUS_MAP.pending
-                  const StIcon = stInfo.icon
-                  const riskInfo = RISK_MAP[getRiskLevel(r)] || RISK_MAP.medium
-                  const workflowInfo = WORKFLOW_MAP[r.workflowStatus || 'new'] || WORKFLOW_MAP.new
-                  return (
-                    <tr key={r.id} className="border-b border-slate-100 hover:bg-slate-50 align-top">
-                      <td className="py-3 px-3"><input type="checkbox" checked={selectedIds.includes(r.id)} onChange={() => toggleSelect(r.id)} /></td>
-                      <td className="py-3 px-3 min-w-[160px]"><p className="font-semibold text-slate-800">{r.candidateName || `简历 #${r.id}`}</p><span className={`inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-full text-xs ${stInfo.color}`}><StIcon className={`w-3 h-3 ${r.status === 'evaluating' ? 'animate-spin' : ''}`} />{stInfo.label}</span></td>
-                      <td className="py-3 px-3 text-slate-600 min-w-[130px]">{r.profileName || '默认模板'}</td>
-                      <td className="py-3 px-3"><div className="text-xl font-bold text-indigo-600">{getMatchScore(r) ?? '-'}</div>{r.aiResult && <GradeBadge grade={r.aiResult} />}</td>
-                      <td className="py-3 px-3"><span className={`px-2 py-1 rounded-full text-xs font-medium ${riskInfo.color}`}>{riskInfo.label}</span></td>
-                      <td className="py-3 px-3 text-slate-600 max-w-[210px]">{getHighlights(r).slice(0, 2).map((x, i) => <p key={i}>• {x}</p>)}</td>
-                      <td className="py-3 px-3 text-slate-600 max-w-[230px]">{getConcerns(r).slice(0, 2).map((x, i) => <p key={i}>• {x}</p>)}</td>
-                      <td className="py-3 px-3"><span className="font-semibold text-slate-800">{getRecommendation(r)}</span></td>
-                      <td className="py-3 px-3">
-                        <select value={r.workflowStatus || 'new'} onChange={e => updateWorkflow(r, e.target.value)} className={`px-2 py-1 rounded-lg text-xs font-medium border-0 ${workflowInfo.color}`}>
-                          {Object.entries(WORKFLOW_MAP).map(([key, item]) => <option key={key} value={key}>{item.label}</option>)}
-                        </select>
-                      </td>
-                      <td className="py-3 px-3 min-w-[180px]"><input value={r.hrNote || ''} onChange={e => setResumes(list => list.map(item => item.id === r.id ? { ...item, hrNote: e.target.value } : item))} onBlur={e => updateWorkflow(r, r.workflowStatus || 'new', e.target.value)} placeholder="如：薪资偏高但可聊" className="w-full px-2 py-1 rounded border border-slate-200 text-xs" /></td>
-                      <td className="py-3 px-3">
-                        <div className="flex gap-2">
-                          {r.status === 'completed' && <button onClick={() => navigate(`/report/${r.id}`)} className="text-indigo-600 hover:text-indigo-800 flex items-center gap-1"><Eye className="w-4 h-4" />报告</button>}
-                          <button onClick={() => updateWorkflow(r, 'archived')} className="text-blue-600 hover:text-blue-800 flex items-center gap-1"><Archive className="w-4 h-4" />入库</button>
-                        </div>
-                      </td>
+          {loading && resumes.length === 0 ? (
+            <div className="flex items-center justify-center py-16 text-slate-400"><Loader2 className="mr-2 h-6 w-6 animate-spin" /> 加载中...</div>
+          ) : filteredResumes.length === 0 ? (
+            <EmptyQueue queue={queue} />
+          ) : (
+            <>
+              <div className="hidden overflow-auto lg:block">
+                <table className="w-full min-w-[980px] text-sm">
+                  <thead className="sticky top-0 z-10 bg-slate-50/95 backdrop-blur">
+                    <tr className="border-b border-slate-200 text-left text-xs font-bold uppercase tracking-wide text-slate-500">
+                      <th className="px-4 py-3"><input type="checkbox" checked={selectedIds.length === filteredResumes.length && filteredResumes.length > 0} onChange={toggleAll} /></th>
+                      <th className="px-4 py-3">候选人</th>
+                      <th className="px-4 py-3">匹配分</th>
+                      <th className="px-4 py-3">建议动作</th>
+                      <th className="px-4 py-3">风险</th>
+                      <th className="px-4 py-3">亮点 / 短板</th>
+                      <th className="px-4 py-3">处理状态</th>
                     </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+                  </thead>
+                  <tbody>
+                    {filteredResumes.map(r => <CandidateRow key={r.id} resume={r} active={activeResumeId === r.id} selected={selectedIds.includes(r.id)} onSelect={() => toggleSelect(r.id)} onOpen={() => { setActiveResumeId(r.id); setNoteDraft(r.hrNote || '') }} onWorkflow={updateWorkflow} />)}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="space-y-3 p-3 lg:hidden">
+                {filteredResumes.map(r => <CandidateCard key={r.id} resume={r} active={activeResumeId === r.id} selected={selectedIds.includes(r.id)} onSelect={() => toggleSelect(r.id)} onOpen={() => { setActiveResumeId(r.id); setNoteDraft(r.hrNote || '') }} />)}
+              </div>
+            </>
+          )}
+        </section>
+
+        <aside className="space-y-4 xl:sticky xl:top-4 xl:self-start">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <h3 className="flex items-center gap-2 font-bold text-slate-900"><PanelRightOpen className="h-5 w-5 text-indigo-500" /> 批量操作</h3>
+            <p className="mt-1 text-sm text-slate-500">当前队列 {filteredResumes.length} 人，已选择 {selectedCount} 人。</p>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button onClick={handleExport} className="rounded-xl bg-emerald-600 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-700"><Download className="mr-1 inline h-4 w-4" />导出</button>
+              <button onClick={handleBatchDelete} disabled={selectedCount === 0 || loading} className="rounded-xl bg-red-600 px-3 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-40"><Trash2 className="mr-1 inline h-4 w-4" />删除</button>
+            </div>
           </div>
-        )}
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <h3 className="flex items-center gap-2 font-bold text-slate-900"><StickyNote className="h-5 w-5 text-indigo-500" /> 候选人详情</h3>
+            {activeResume ? (
+              <div className="mt-4 space-y-4">
+                <div>
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="font-bold text-slate-950">{activeResume.candidateName || `简历 #${activeResume.id}`}</p>
+                      <p className="text-xs text-slate-500">{activeResume.profileName || '默认模板'}</p>
+                    </div>
+                    <span className={`rounded-full border px-2 py-1 text-xs font-bold ${RECOMMENDATION_MAP[getRecommendation(activeResume)]?.soft || 'border-slate-200 bg-slate-100 text-slate-600'}`}>{getRecommendation(activeResume)}</span>
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <MiniStat label="匹配分" value={getMatchScore(activeResume) ?? '-'} />
+                    <MiniStat label="风险" value={RISK_MAP[getRiskLevel(activeResume)]?.label || '中风险'} />
+                  </div>
+                </div>
+
+                <div>
+                  <p className="mb-2 text-xs font-bold uppercase tracking-wide text-emerald-700">亮点</p>
+                  {getHighlights(activeResume).slice(0, 3).length ? getHighlights(activeResume).slice(0, 3).map((item, i) => <p key={i} className="mb-1 text-sm text-slate-600">• {item}</p>) : <p className="text-sm text-slate-400">暂无结构化亮点，打开报告查看完整评估。</p>}
+                </div>
+                <div>
+                  <p className="mb-2 text-xs font-bold uppercase tracking-wide text-amber-700">短板 / 风险</p>
+                  {getConcerns(activeResume).slice(0, 3).length ? getConcerns(activeResume).slice(0, 3).map((item, i) => <p key={i} className="mb-1 text-sm text-slate-600">• {item}</p>) : <p className="text-sm text-slate-400">暂无结构化短板，打开报告查看完整评估。</p>}
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-sm font-semibold text-slate-700">处理状态</label>
+                  <select value={activeResume.workflowStatus || 'new'} onChange={e => updateWorkflow(activeResume, e.target.value, noteDraft)} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-indigo-500">
+                    {Object.entries(WORKFLOW_MAP).map(([key, item]) => <option key={key} value={key}>{item.label}</option>)}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-sm font-semibold text-slate-700">HR备注</label>
+                  <textarea value={noteDraft} onChange={e => setNoteDraft(e.target.value)} onBlur={() => updateWorkflow(activeResume, activeResume.workflowStatus || 'new', noteDraft)} rows={4} placeholder="如：业务方觉得项目不错；薪资偏高但可聊" className="w-full resize-none rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-indigo-500" />
+                  <SaveHint state={saveState.id === activeResume.id ? saveState.status : ''} />
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  {activeResume.status === 'completed' && <button onClick={() => navigate(`/report/${activeResume.id}`)} className="rounded-xl bg-indigo-600 px-3 py-2 text-sm font-semibold text-white hover:bg-indigo-700"><Eye className="mr-1 inline h-4 w-4" />报告</button>}
+                  <button onClick={() => updateWorkflow(activeResume, 'archived', noteDraft)} className="rounded-xl bg-blue-600 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-700"><Archive className="mr-1 inline h-4 w-4" />入库</button>
+                </div>
+              </div>
+            ) : (
+              <p className="mt-4 text-sm text-slate-400">选择一个候选人后，这里会显示亮点、风险、备注和快捷动作。</p>
+            )}
+          </div>
+        </aside>
       </div>
+    </div>
+  )
+}
+
+function MetricCard({ icon: Icon, label, value, tone }) {
+  const tones = {
+    slate: 'text-slate-900 bg-slate-100',
+    emerald: 'text-emerald-700 bg-emerald-100',
+    amber: 'text-amber-700 bg-amber-100',
+    red: 'text-red-700 bg-red-100',
+    indigo: 'text-indigo-700 bg-indigo-100',
+  }
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex items-center justify-between">
+        <p className="text-sm text-slate-500">{label}</p>
+        <span className={`rounded-xl p-2 ${tones[tone] || tones.slate}`}><Icon className="h-4 w-4" /></span>
+      </div>
+      <p className="mt-3 text-3xl font-black text-slate-950">{value}</p>
+    </div>
+  )
+}
+
+function MiniStat({ label, value }) {
+  return <div className="rounded-xl bg-slate-50 p-3"><p className="text-xs text-slate-500">{label}</p><p className="mt-1 font-bold text-slate-900">{value}</p></div>
+}
+
+function SaveHint({ state }) {
+  if (!state) return null
+  if (state === 'saving') return <p className="mt-1 text-xs text-slate-400">正在保存...</p>
+  if (state === 'saved') return <p className="mt-1 flex items-center gap-1 text-xs text-emerald-600"><Check className="h-3 w-3" /> 已保存</p>
+  return <p className="mt-1 flex items-center gap-1 text-xs text-red-600"><AlertCircle className="h-3 w-3" /> 保存失败</p>
+}
+
+function CandidateRow({ resume, active, selected, onSelect, onOpen, onWorkflow }) {
+  const status = STATUS_MAP[resume.status] || STATUS_MAP.pending
+  const StatusIcon = status.icon
+  const risk = RISK_MAP[getRiskLevel(resume)] || RISK_MAP.medium
+  const recommendation = RECOMMENDATION_MAP[getRecommendation(resume)] || RECOMMENDATION_MAP['待定']
+  const workflow = WORKFLOW_MAP[resume.workflowStatus || 'new'] || WORKFLOW_MAP.new
+  const highlights = getHighlights(resume).slice(0, 1)
+  const concerns = getConcerns(resume).slice(0, 1)
+
+  return (
+    <tr onClick={onOpen} className={`cursor-pointer border-b border-slate-100 align-top transition hover:bg-slate-50 ${active ? 'bg-indigo-50/60' : ''}`}>
+      <td className={`w-2 p-0 ${risk.rail}`}></td>
+      <td className="px-4 py-3" onClick={e => e.stopPropagation()}><input type="checkbox" checked={selected} onChange={onSelect} /></td>
+      <td className="px-4 py-3">
+        <p className="font-bold text-slate-900">{resume.candidateName || `简历 #${resume.id}`}</p>
+        <span className={`mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${status.color}`}><StatusIcon className={`h-3 w-3 ${resume.status === 'evaluating' ? 'animate-spin' : ''}`} />{status.label}</span>
+      </td>
+      <td className="px-4 py-3"><div className="text-2xl font-black text-slate-950">{getMatchScore(resume) ?? '-'}</div>{resume.aiResult && <GradeBadge grade={resume.aiResult} />}</td>
+      <td className="px-4 py-3"><span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-bold ${recommendation.color}`}>{getRecommendation(resume)}</span></td>
+      <td className="px-4 py-3"><span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${risk.color}`}>{risk.label}</span></td>
+      <td className="px-4 py-3 text-slate-600">
+        {highlights.map((item, i) => <p key={`h-${i}`} className="line-clamp-1">+ {item}</p>)}
+        {concerns.map((item, i) => <p key={`c-${i}`} className="line-clamp-1 text-amber-700">- {item}</p>)}
+        {!highlights.length && !concerns.length && <span className="text-slate-400">打开报告查看完整分析</span>}
+      </td>
+      <td className="px-4 py-3" onClick={e => e.stopPropagation()}>
+        <select value={resume.workflowStatus || 'new'} onChange={e => onWorkflow(resume, e.target.value)} className={`rounded-lg border-0 px-2 py-1 text-xs font-semibold ${workflow.color}`}>
+          {Object.entries(WORKFLOW_MAP).map(([key, item]) => <option key={key} value={key}>{item.label}</option>)}
+        </select>
+      </td>
+    </tr>
+  )
+}
+
+function CandidateCard({ resume, active, selected, onSelect, onOpen }) {
+  const risk = RISK_MAP[getRiskLevel(resume)] || RISK_MAP.medium
+  const recommendation = RECOMMENDATION_MAP[getRecommendation(resume)] || RECOMMENDATION_MAP['待定']
+  return (
+    <div onClick={onOpen} className={`rounded-2xl border bg-white p-4 shadow-sm ${active ? 'border-indigo-300 ring-2 ring-indigo-100' : 'border-slate-200'}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <input type="checkbox" checked={selected} onChange={onSelect} onClick={e => e.stopPropagation()} />
+          <div>
+            <p className="font-bold text-slate-900">{resume.candidateName || `简历 #${resume.id}`}</p>
+            <p className="text-xs text-slate-500">匹配分 {getMatchScore(resume) ?? '-'}</p>
+          </div>
+        </div>
+        <span className={`rounded-full px-2 py-1 text-xs font-bold ${recommendation.color}`}>{getRecommendation(resume)}</span>
+      </div>
+      <div className="mt-3 flex items-center gap-2"><span className={`rounded-full border px-2 py-1 text-xs font-semibold ${risk.color}`}>{risk.label}</span>{resume.aiResult && <GradeBadge grade={resume.aiResult} />}</div>
     </div>
   )
 }
