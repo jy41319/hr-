@@ -37,6 +37,24 @@ function DimensionCard({ dim }) {
   )
 }
 
+const DIMENSION_LABELS = {
+  basic_info: '基本信息完整性',
+  format: '格式规范性',
+  work_logic: '工作经历逻辑性',
+  skill_match: '技能匹配度',
+  risk_assessment: '风险评估',
+  overall_impression: '综合印象',
+}
+
+function normalizeDimensions(value) {
+  if (Array.isArray(value)) return value
+  if (!value || typeof value !== 'object') return []
+  return Object.entries(value).map(([key, item]) => ({
+    dimension: item?.dimension || DIMENSION_LABELS[key] || key,
+    ...item,
+  }))
+}
+
 export default function ResumeReviewPage() {
   const [profiles, setProfiles] = useState([])
   const [records, setRecords] = useState([])
@@ -146,7 +164,7 @@ export default function ResumeReviewPage() {
   }
 
   const evaluationSummary = evaluation?.overall_evaluation
-  const dimensionScores = evaluation?.dimension_evaluations || []
+  const dimensionScores = normalizeDimensions(evaluation?.dimension_evaluations)
   const radarData = dimensionScores.length
     ? dimensionScores.map(d => ({
       dimension: d.dimension,

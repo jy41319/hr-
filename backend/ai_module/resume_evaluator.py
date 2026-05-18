@@ -4,11 +4,12 @@ import json
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from typing import Dict, Any, Optional, Type
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from openai import OpenAI
 from pydantic import ValidationError
 from datetime import datetime
 
@@ -50,6 +51,11 @@ class ResumeEvaluator:
         if not all([self.api_key, self.api_base, self.model_name]):
             raise ValueError("未找到可用的LLM模型配置")
 
+        self.request_timeout = int(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
+        # Kimi K2.6 may spend part of the completion budget on reasoning tokens
+        # before emitting the final JSON, so the default must leave enough room.
+        self.response_max_tokens = int(os.getenv("LLM_RESPONSE_MAX_TOKENS", "2400"))
+
         llm_kwargs = {}
         if self.enable_thinking:
             llm_kwargs['model_kwargs'] = {"extra_body": {"enable_thinking": True}}
@@ -59,6 +65,8 @@ class ResumeEvaluator:
             openai_api_key=self.api_key,
             openai_api_base=self.api_base,
             temperature=normalize_temperature(self.model_name, 0.5),
+            timeout=self.request_timeout,
+            max_tokens=self.response_max_tokens,
             **llm_kwargs,
         )
 
@@ -68,6 +76,8 @@ class ResumeEvaluator:
                 openai_api_key=self.api_key,
                 openai_api_base=self.api_base,
                 temperature=normalize_temperature(self.model_name, 0.5),
+                timeout=self.request_timeout,
+                max_tokens=self.response_max_tokens,
             )
         else:
             self.llm_structured = self.llm
@@ -172,9 +182,10 @@ class ResumeEvaluator:
 
         for attempt in range(max_attempts):
             full_prompt = prompt_text + retry_instructions[min(attempt, len(retry_instructions) - 1)]
-            response = self.llm.invoke(full_prompt)
-            raw_text = self._get_response_text(response)
-            input_tokens, output_tokens = extract_token_usage(response, full_prompt, raw_text)
+            response = self._invoke_llm_text(full_prompt)
+            raw_text = response["text"]
+            input_tokens = response["input_tokens"]
+            output_tokens = response["output_tokens"]
             tokens = input_tokens + output_tokens
             total_tokens += tokens
             accumulate_model_tokens(input_tokens, output_tokens)
@@ -188,6 +199,108 @@ class ResumeEvaluator:
                 print(f"    [WARNING] {label} 第 {attempt + 1} 次解析失败: {exc}")
 
         raise ValueError(f"{label} 在 {max_attempts} 次尝试后仍未返回有效JSON: {last_error}")
+
+    def _invoke_llm_text(self, prompt_text: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        completion_limit = max_tokens or self.response_max_tokens
+        if (self.model_name or "").lower().startswith("kimi-"):
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+                timeout=self.request_timeout,
+                max_retries=1,
+            )
+            completion = client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt_text}],
+                temperature=normalize_temperature(self.model_name, 0.5),
+                max_tokens=completion_limit,
+            )
+            text = completion.choices[0].message.content or ""
+            usage = completion.usage
+            return {
+                "text": text.strip(),
+                "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            }
+
+        response = self.llm.invoke(prompt_text)
+        raw_text = self._get_response_text(response)
+        input_tokens, output_tokens = extract_token_usage(response, prompt_text, raw_text)
+        return {
+            "text": raw_text,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+
+    def _evaluate_resume_single_pass(self, resume_content: str) -> tuple:
+        criteria = self.criteria_data["evaluation_criteria"]
+        compact_criteria = {
+            key: {
+                "weight": value.get("weight"),
+                "description": value.get("description"),
+                "aspects": value.get("aspects", []),
+            }
+            for key, value in criteria.items()
+        }
+        prompt_text = f"""你是一位资深HR简历审查专家。请基于当前日期 {datetime.now().strftime('%Y-%m-%d')} 审查这份求职简历。
+
+评审维度JSON:
+{json.dumps(compact_criteria, ensure_ascii=False)}
+
+简历全文:
+---
+{resume_content[:12000]}
+---
+
+只输出一个JSON对象，不要输出Markdown代码块或解释。JSON结构必须完全如下:
+{{
+  "dimension_evaluations": {{
+    "basic_info": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
+    "format": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
+    "work_logic": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
+    "skill_match": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
+    "risk_assessment": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
+    "overall_impression": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}}
+  }},
+  "overall_evaluation": {{
+    "overall_score": 0,
+    "overall_grade": "A/B/C/D/E",
+    "overall_feedback": "150字以内总评",
+    "recommendations": ["建议1", "建议2", "建议3"]
+  }}
+}}
+"""
+        response = self._invoke_llm_text(
+            prompt_text,
+            max_tokens=int(os.getenv("KIMI_SINGLE_PASS_MAX_TOKENS", "5000")),
+        )
+        raw_text = response["text"]
+        input_tokens = response["input_tokens"]
+        output_tokens = response["output_tokens"]
+        accumulate_model_tokens(input_tokens, output_tokens)
+
+        payload = self._extract_json_payload(raw_text)
+        dimension_evals = {}
+        raw_dimensions = payload.get("dimension_evaluations") or {}
+        for key, info in criteria.items():
+            raw_dimension = raw_dimensions.get(key) or {}
+            dimension_evals[key] = self._validate_payload(
+                resume_prompts.DimensionEvaluation,
+                raw_dimension,
+            )
+
+        overall_eval = self._validate_payload(
+            resume_prompts.OverallEvaluation,
+            payload.get("overall_evaluation") or {},
+        )
+        rounded_score = round(overall_eval["overall_score"])
+        overall_eval["overall_score"] = rounded_score
+        overall_eval["overall_grade"] = self._get_letter_grade(rounded_score)
+
+        return {
+            "dimension_evaluations": dimension_evals,
+            "overall_evaluation": overall_eval,
+        }, input_tokens + output_tokens
 
     def _evaluate_single_dimension(self, resume_content: str, criterion_key: str, criterion_info: Dict) -> tuple:
         prompt_template_str = self.dimension_prompt_template_str.replace('{discipline}', self.position_type)
@@ -320,6 +433,10 @@ class ResumeEvaluator:
                 and len(s.text.strip()) >= 10
             ]
             resume_content = "\n\n".join(body_texts)
+            plain_content = self.document_reader.read(resume_path)
+            if len(plain_content.strip()) > len(resume_content.strip()) * 1.05:
+                resume_content = plain_content
+                print("   ...结构化内容缺失较多，已切换为全文提取结果。")
             print(f"   ...完成。提取 {len(body_texts)} 段，共 {len(resume_content)} 字符。")
         except Exception as e:
             print(f"   ⚠ 结构化提取失败({e})，回退到简单提取...")
@@ -328,24 +445,65 @@ class ResumeEvaluator:
 
         if cancel_check: cancel_check()
 
+        if (self.model_name or "").lower().startswith("kimi-"):
+            print("\n[步骤 2/4] Kimi K2.6 使用单次紧凑评审...")
+            try:
+                result_json, total_tokens = self._evaluate_resume_single_pass(resume_content)
+                overall_eval = result_json["overall_evaluation"]
+                print(f"   ...完成。(总分: {overall_eval['overall_score']})")
+                end_time = time.time()
+                print(f"\n== AI审查完成，耗时: {end_time - start_time:.2f}s，Token: {total_tokens}")
+                return result_json, total_tokens
+            except Exception as exc:
+                print(f"   [WARNING] Kimi 单次评审失败，回退到分维度审查: {exc}")
+                if cancel_check: cancel_check()
+
         print("\n[步骤 2/4] 开始分维度审查（并行）...")
         dimension_evals = {}
         total_tokens = 0
         criteria = self.criteria_data["evaluation_criteria"]
 
         def _eval_dim(key, info):
-            result, tokens = self._evaluate_single_dimension(resume_content, key, info)
+            try:
+                result, tokens = self._evaluate_single_dimension(resume_content, key, info)
+            except Exception as exc:
+                print(f"   [WARNING] {info['description']} 审查失败，已使用兜底结果: {exc}")
+                result = {
+                    "dimension": info["description"],
+                    "score": 50,
+                    "feedback": f"该维度暂未完成自动审查，请人工复核。原因: {exc}",
+                    "strengths": "待人工复核",
+                    "weaknesses": "自动审查未完成",
+                }
+                tokens = 0
             return key, result, tokens
 
-        executor = ThreadPoolExecutor(max_workers=len(criteria))
+        max_workers = min(len(criteria), int(os.getenv("EVALUATION_MAX_WORKERS", "1")))
+        dimension_timeout = int(os.getenv("EVALUATION_DIMENSIONS_TIMEOUT", "420"))
+        executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
             futures = {executor.submit(_eval_dim, k, v): k for k, v in criteria.items()}
-            for future in as_completed(futures):
+            for future in as_completed(futures, timeout=dimension_timeout):
                 if cancel_check: cancel_check()
                 key, result, tokens = future.result()
                 dimension_evals[key] = result
                 total_tokens += tokens
                 print(f"   ✓ {criteria[key]['description']} (得分: {result['score']})")
+        except TimeoutError:
+            print(f"   [WARNING] 分维度审查超过 {dimension_timeout}s，未完成维度已标记为人工复核。")
+            for future, key in futures.items():
+                if key in dimension_evals:
+                    continue
+                info = criteria[key]
+                if not future.done():
+                    future.cancel()
+                dimension_evals[key] = {
+                    "dimension": info["description"],
+                    "score": 50,
+                    "feedback": f"{info['description']}审查超时，请人工复核。",
+                    "strengths": "待人工复核",
+                    "weaknesses": "自动审查超时",
+                }
         except TaskCancelledError:
             executor.shutdown(wait=False, cancel_futures=True)
             raise
@@ -411,6 +569,7 @@ def run_evaluation_in_background(app, db, resume_id: int, task_token: str):
             resume.status = 'completed'
             resume.ai_result = result_json.get("overall_evaluation", {}).get("overall_grade", "N/A")
             resume.evaluation_result = result_json
+            resume.evaluation_time = datetime.utcnow()
             resume.tokens_used = (resume.tokens_used or 0) + total_tokens
             resume.evaluation_error_message = None
             resume.evaluation_task_token = None

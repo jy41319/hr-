@@ -98,6 +98,25 @@ def _require_admin():
     return None
 
 
+def _build_upload_filename(original_filename, fallback_prefix='resume'):
+    ext = os.path.splitext(original_filename or '')[1].lower()
+    base = os.path.splitext(original_filename or '')[0]
+    safe_base = secure_filename(base) or fallback_prefix
+    return f"{uuid.uuid4().hex[:8]}_{safe_base}{ext}"
+
+
+def _validate_uploaded_document(filepath):
+    from ai_module.document_reader import get_document_reader
+    validation = get_document_reader().validate_file(filepath)
+    if not validation.get('valid'):
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        return validation.get('message') or '文件无法解析，请检查文件格式'
+    return None
+
+
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json or {}
@@ -225,6 +244,23 @@ def download_report(id):
 
     overall = (resume.evaluation_result or {}).get('overall_evaluation', {})
     dims = (resume.evaluation_result or {}).get('dimension_evaluations', [])
+    dimension_labels = {
+        'basic_info': '基本信息完整性',
+        'format': '格式规范性',
+        'work_logic': '工作经历逻辑性',
+        'skill_match': '技能匹配度',
+        'risk_assessment': '风险评估',
+        'overall_impression': '综合印象',
+    }
+    if isinstance(dims, dict):
+        dims = [
+            {
+                **value,
+                'dimension': value.get('dimension') or dimension_labels.get(key, key),
+            }
+            for key, value in dims.items()
+            if isinstance(value, dict)
+        ]
     lines = [
         "HR简历评审报告",
         f"候选人: {resume.candidate_name or '未命名'}",
@@ -266,16 +302,18 @@ def upload_resume():
     if ext not in ['.docx', '.pdf']:
         return jsonify({'error': '仅支持 .docx 和 .pdf 文件'}), 400
 
-    filename = secure_filename(file.filename)
-    if not filename:
-        filename = f"resume_{uuid.uuid4().hex[:8]}{ext}"
+    filename = _build_upload_filename(file.filename)
 
     upload_dir = os.path.join(STORAGE_PATH, UPLOAD_FOLDER)
     os.makedirs(upload_dir, exist_ok=True)
     filepath = os.path.join(upload_dir, filename)
     file.save(filepath)
 
-    candidate_name = request.form.get('candidateName', '')
+    validation_error = _validate_uploaded_document(filepath)
+    if validation_error:
+        return jsonify({'error': validation_error}), 400
+
+    candidate_name = request.form.get('candidateName', '').strip() or os.path.splitext(file.filename)[0]
     profile_id = request.form.get('profileId', None, type=int)
 
     resume = Resume(
@@ -310,13 +348,22 @@ def batch_upload():
         if ext not in ['.docx', '.pdf']:
             continue
 
-        filename = secure_filename(file.filename) or f"resume_{uuid.uuid4().hex[:8]}{ext}"
+        filename = _build_upload_filename(file.filename)
         filepath = os.path.join(upload_dir, filename)
         file.save(filepath)
 
+        validation_error = _validate_uploaded_document(filepath)
+        if validation_error:
+            results.append({
+                'filename': file.filename,
+                'status': 'failed',
+                'error': validation_error,
+            })
+            continue
+
         resume = Resume(
             user_id=user.id,
-            candidate_name=filename.replace(ext, ''),
+            candidate_name=os.path.splitext(file.filename)[0],
             resume_url=filepath,
             profile_id=profile_id,
         )
@@ -324,7 +371,11 @@ def batch_upload():
         results.append(resume)
 
     db.session.commit()
-    return jsonify({'resumes': [r.to_dict_light() for r in results], 'count': len(results)})
+    return jsonify({
+        'resumes': [r.to_dict_light() for r in results if isinstance(r, Resume)],
+        'failed': [r for r in results if isinstance(r, dict)],
+        'count': len([r for r in results if isinstance(r, Resume)]),
+    })
 
 
 @app.route('/api/evaluate/<int:id>', methods=['POST'])

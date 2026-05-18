@@ -16,3 +16,5 @@ __pycache__/
 # local runtime data
 storage/flask_session/
 storage/*.db
+storage/uploads/
+storage/exports/
