@@ -1,0 +1,96 @@
+{
+  "evaluation_criteria": {
+    "basic_info": {
+      "weight": 0.15,
+      "description": "基本信息完整性",
+      "aspects": [
+        "姓名/联系方式/邮箱是否完整",
+        "年龄/学历/专业信息是否明确",
+        "求职意向是否清晰",
+        "照片/个人基础信息是否规范"
+      ]
+    },
+    "format": {
+      "weight": 0.10,
+      "description": "格式规范性",
+      "aspects": [
+        "排版整洁度和可读性",
+        "错别字/语法错误",
+        "标点符号使用规范",
+        "篇幅适当性（通常1-2页）"
+      ]
+    },
+    "work_logic": {
+      "weight": 0.30,
+      "description": "工作经历逻辑性",
+      "aspects": [
+        "时间线连贯性和一致性",
+        "职位晋升合理性",
+        "工作内容与职位匹配度",
+        "业绩描述具体性和可信度"
+      ]
+    },
+    "skill_match": {
+      "weight": 0.20,
+      "description": "技能匹配度",
+      "aspects": [
+        "核心技能描述清晰度",
+        "技能深度和广度",
+        "证书/认证支撑",
+        "项目经验对技能的佐证"
+      ]
+    },
+    "risk_assessment": {
+      "weight": 0.15,
+      "description": "风险评估",
+      "aspects": [
+        "时间线矛盾或重叠",
+        "夸大表述或虚构痕迹",
+        "关键信息刻意缺失",
+        "AI生成内容痕迹"
+      ]
+    },
+    "overall_impression": {
+      "weight": 0.10,
+      "description": "综合印象",
+      "aspects": [
+        "职业成熟度",
+        "自我评价客观性",
+        "亮点突出程度",
+        "求职诚意体现"
+      ]
+    }
+  },
+  "scoring_scale": {
+    "excellent": {
+      "min_score": 90,
+      "max_score": 100,
+      "grade": "优秀",
+      "description": "简历质量优秀，候选人资质出众"
+    },
+    "good": {
+      "min_score": 80,
+      "max_score": 89,
+      "grade": "良好",
+      "description": "简历质量良好，基本符合岗位要求"
+    },
+    "fair": {
+      "min_score": 70,
+      "max_score": 79,
+      "grade": "中等",
+      "description": "简历质量中等，有一定改进空间"
+    },
+    "poor": {
+      "min_score": 60,
+      "max_score": 69,
+      "grade": "及格",
+      "description": "简历质量勉强及格，存在明显不足"
+    },
+    "fail": {
+      "min_score": 0,
+      "max_score": 59,
+      "grade": "不及格",
+      "description": "简历质量不及格，建议不予考虑"
+    }
+  }
+}
