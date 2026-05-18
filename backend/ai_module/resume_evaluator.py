@@ -232,7 +232,82 @@ class ResumeEvaluator:
             "output_tokens": output_tokens,
         }
 
-    def _evaluate_resume_single_pass(self, resume_content: str) -> tuple:
+    def _normalize_list(self, value, fallback=None):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str) and value.strip():
+            return [item.strip(" -0123456789.、)") for item in re.split(r"[\n;；]+", value) if item.strip()]
+        return fallback or []
+
+    def _normalize_evidence(self, value):
+        if not isinstance(value, list):
+            return []
+        normalized = []
+        allowed_types = {'timeline', 'missing_info', 'credential', 'exaggeration', 'aigc', 'salary'}
+        for item in value[:8]:
+            if isinstance(item, str):
+                normalized.append({
+                    "risk_type": "exaggeration",
+                    "risk_label": "夸大表述",
+                    "evidence": item[:240],
+                    "finding": "需人工复核",
+                })
+                continue
+            if not isinstance(item, dict):
+                continue
+            risk_type = item.get("risk_type") or item.get("type") or "exaggeration"
+            if risk_type not in allowed_types:
+                risk_type = "exaggeration"
+            normalized.append({
+                "risk_type": risk_type,
+                "risk_label": item.get("risk_label") or item.get("label") or {
+                    "timeline": "时间线矛盾",
+                    "missing_info": "信息缺失",
+                    "credential": "证书/学历疑点",
+                    "exaggeration": "夸大表述",
+                    "aigc": "AI痕迹",
+                    "salary": "薪资预期不合理",
+                }.get(risk_type, "风险证据"),
+                "evidence": str(item.get("evidence") or item.get("quote") or "")[:240],
+                "finding": str(item.get("finding") or item.get("detail") or item.get("reason") or "")[:240],
+            })
+        return normalized
+
+    def _normalize_decision_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        overall = payload.get("overall_evaluation") or {}
+        match_score = payload.get("match_score", overall.get("overall_score", 0))
+        try:
+            match_score = max(0, min(100, int(round(float(match_score)))))
+        except (TypeError, ValueError):
+            match_score = 0
+
+        recommendation = payload.get("recommendation") or ""
+        if recommendation not in {"推荐面试", "待定", "建议淘汰", "建议人工复核"}:
+            risk_level = payload.get("risk_level") or ""
+            score = overall.get("overall_score") or match_score
+            if risk_level == "high":
+                recommendation = "建议人工复核"
+            elif score >= 75:
+                recommendation = "推荐面试"
+            elif score >= 60:
+                recommendation = "待定"
+            else:
+                recommendation = "建议淘汰"
+
+        risk_level = payload.get("risk_level") or "medium"
+        if risk_level not in {"low", "medium", "high"}:
+            risk_level = "medium"
+
+        payload["match_score"] = match_score
+        payload["recommendation"] = recommendation
+        payload["risk_level"] = risk_level
+        payload["highlights"] = self._normalize_list(payload.get("highlights"), ["暂无明确亮点"])
+        payload["concerns"] = self._normalize_list(payload.get("concerns"), ["暂无明确短板"])
+        payload["interview_questions"] = self._normalize_list(payload.get("interview_questions"), ["请候选人补充说明简历中的关键经历"],)[:5]
+        payload["evidence_snippets"] = self._normalize_evidence(payload.get("evidence_snippets"))
+        return payload
+
+    def _evaluate_resume_single_pass(self, resume_content: str, job_description: str = "") -> tuple:
         criteria = self.criteria_data["evaluation_criteria"]
         compact_criteria = {
             key: {
@@ -242,7 +317,14 @@ class ResumeEvaluator:
             }
             for key, value in criteria.items()
         }
+        jd_block = job_description.strip() or "未提供JD。请按岗位模板和通用中小企业初筛标准评估。"
         prompt_text = f"""你是一位资深HR简历审查专家。请基于当前日期 {datetime.now().strftime('%Y-%m-%d')} 审查这份求职简历。
+产品目标：帮助中小企业HR在5分钟内完成批量初筛、风险识别、候选人排序和面试建议。
+
+岗位JD/需求:
+---
+{jd_block[:6000]}
+---
 
 评审维度JSON:
 {json.dumps(compact_criteria, ensure_ascii=False)}
@@ -254,6 +336,15 @@ class ResumeEvaluator:
 
 只输出一个JSON对象，不要输出Markdown代码块或解释。JSON结构必须完全如下:
 {{
+  "match_score": 0,
+  "recommendation": "推荐面试/待定/建议淘汰/建议人工复核",
+  "risk_level": "low/medium/high",
+  "highlights": ["3个候选人亮点，每条不超过35字"],
+  "concerns": ["3个主要短板或风险，每条不超过35字"],
+  "interview_questions": ["5个建议面试追问"],
+  "evidence_snippets": [
+    {{"risk_type": "timeline/missing_info/credential/exaggeration/aigc/salary", "risk_label": "时间线矛盾/信息缺失/证书或学历疑点/夸大表述/AI痕迹/薪资预期不合理", "evidence": "简历原文短句", "finding": "基于原文的判断"}}
+  ],
   "dimension_evaluations": {{
     "basic_info": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
     "format": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
@@ -269,6 +360,11 @@ class ResumeEvaluator:
     "recommendations": ["建议1", "建议2", "建议3"]
   }}
 }}
+
+重要规则:
+- 如果风险等级为high，不要直接给“建议淘汰”，优先给“建议人工复核”。
+- 每个evidence_snippets必须引用简历原文短句，不能只有结论。
+- 如果提供了JD，match_score必须体现JD匹配度，而不是通用简历质量分。
 """
         response = self._invoke_llm_text(
             prompt_text,
@@ -280,6 +376,7 @@ class ResumeEvaluator:
         accumulate_model_tokens(input_tokens, output_tokens)
 
         payload = self._extract_json_payload(raw_text)
+        payload = self._normalize_decision_payload(payload)
         dimension_evals = {}
         raw_dimensions = payload.get("dimension_evaluations") or {}
         for key, info in criteria.items():
@@ -298,6 +395,13 @@ class ResumeEvaluator:
         overall_eval["overall_grade"] = self._get_letter_grade(rounded_score)
 
         return {
+            "match_score": payload["match_score"],
+            "recommendation": payload["recommendation"],
+            "risk_level": payload["risk_level"],
+            "highlights": payload["highlights"][:3],
+            "concerns": payload["concerns"][:3],
+            "interview_questions": payload["interview_questions"][:5],
+            "evidence_snippets": payload["evidence_snippets"],
             "dimension_evaluations": dimension_evals,
             "overall_evaluation": overall_eval,
         }, input_tokens + output_tokens
@@ -415,7 +519,7 @@ class ResumeEvaluator:
                 "recommendations": ["请重点关注各维度中标注的不足之处"]
             }, 0
 
-    def evaluate_resume(self, resume_path: str, cancel_check=None) -> Dict[str, Any]:
+    def evaluate_resume(self, resume_path: str, job_description: str = "", cancel_check=None) -> Dict[str, Any]:
         print("\n" + "="*50)
         print(f"== 开始审查简历: {os.path.basename(resume_path)}")
         print(f"== 使用岗位模板: {self.position_type}")
@@ -448,7 +552,7 @@ class ResumeEvaluator:
         if (self.model_name or "").lower().startswith("kimi-"):
             print("\n[步骤 2/4] Kimi K2.6 使用单次紧凑评审...")
             try:
-                result_json, total_tokens = self._evaluate_resume_single_pass(resume_content)
+                result_json, total_tokens = self._evaluate_resume_single_pass(resume_content, job_description)
                 overall_eval = result_json["overall_evaluation"]
                 print(f"   ...完成。(总分: {overall_eval['overall_score']})")
                 end_time = time.time()
@@ -519,7 +623,18 @@ class ResumeEvaluator:
         end_time = time.time()
         print(f"\n== AI审查完成，耗时: {end_time - start_time:.2f}s，Token: {total_tokens}")
 
+        decision_payload = self._normalize_decision_payload({
+            "match_score": overall_eval.get("overall_score", 0),
+            "risk_level": "high" if any(v.get("score", 100) < 55 for v in dimension_evals.values()) else "medium",
+            "highlights": [v.get("strengths", "") for v in dimension_evals.values() if v.get("strengths")][:3],
+            "concerns": [v.get("weaknesses", "") for v in dimension_evals.values() if v.get("weaknesses")][:3],
+            "interview_questions": ["请候选人解释简历中最核心项目的个人贡献", "请候选人补充与岗位JD最匹配的案例"],
+            "evidence_snippets": [],
+            "overall_evaluation": overall_eval,
+        })
+
         return {
+            **decision_payload,
             "dimension_evaluations": dimension_evals,
             "overall_evaluation": overall_eval
         }, total_tokens
@@ -561,6 +676,7 @@ def run_evaluation_in_background(app, db, resume_id: int, task_token: str):
             evaluator = ResumeEvaluator(profile_config=profile_config)
             result_json, total_tokens = evaluator.evaluate_resume(
                 resume.resume_url,
+                job_description=resume.job_description or "",
                 cancel_check=lambda: ensure_task_active(db.session, resume, 'evaluation', task_token)
             )
 
@@ -573,6 +689,14 @@ def run_evaluation_in_background(app, db, resume_id: int, task_token: str):
             resume.tokens_used = (resume.tokens_used or 0) + total_tokens
             resume.evaluation_error_message = None
             resume.evaluation_task_token = None
+            if result_json.get("recommendation") == "推荐面试":
+                resume.workflow_status = "shortlisted"
+            elif result_json.get("recommendation") == "建议人工复核" or result_json.get("risk_level") == "high":
+                resume.workflow_status = "needs_review"
+            elif result_json.get("recommendation") == "建议淘汰":
+                resume.workflow_status = "rejected"
+            else:
+                resume.workflow_status = resume.workflow_status or "new"
 
             db.session.commit()
             print(f"[后台任务] ✅ 简历 ID: {resume_id} 审查成功。")
@@ -585,6 +709,7 @@ def run_evaluation_in_background(app, db, resume_id: int, task_token: str):
             from .document_reader import classify_file_error
             friendly_msg = classify_file_error(e)
             resume.status = 'failed'
+            resume.workflow_status = 'needs_review'
             resume.evaluation_error_message = friendly_msg
             resume.evaluation_task_token = None
             db.session.commit()

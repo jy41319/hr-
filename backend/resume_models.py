@@ -92,6 +92,9 @@ class Resume(db.Model):
     resume_url = db.Column(db.String(300), nullable=False)
 
     status = db.Column(db.String(50), default='pending')
+    workflow_status = db.Column(db.String(50), default='new')
+    hr_note = db.Column(db.Text, nullable=True)
+    job_description = db.Column(db.Text, nullable=True)
     ai_result = db.Column(db.String(10), nullable=True)
     evaluation_result = db.Column(db.JSON, nullable=True)
 
@@ -127,15 +130,47 @@ class Resume(db.Model):
     aigc_detections = db.relationship('AigcDetection', backref='resume', lazy=True, cascade='all, delete-orphan')
     risk_flags = db.relationship('RiskFlag', backref='resume', lazy=True, cascade='all, delete-orphan')
 
+    def _decision_summary(self):
+        result = self.evaluation_result or {}
+        overall = result.get('overall_evaluation', {})
+        overall_score = overall.get('overall_score')
+        match_score = result.get('match_score') if result.get('match_score') is not None else overall_score
+        risk_level = result.get('risk_level')
+        if not risk_level:
+            risk_level = 'high' if (overall_score or 0) < 60 else 'medium' if (overall_score or 0) < 75 else 'low'
+        recommendation = result.get('recommendation')
+        if not recommendation:
+            if risk_level == 'high':
+                recommendation = '建议人工复核'
+            elif (match_score or 0) >= 75:
+                recommendation = '推荐面试'
+            elif (match_score or 0) >= 60:
+                recommendation = '待定'
+            else:
+                recommendation = '建议淘汰'
+        return {
+            'overallScore': overall_score,
+            'matchScore': match_score,
+            'recommendation': recommendation if self.evaluation_result else None,
+            'riskLevel': risk_level if self.evaluation_result else None,
+            'highlights': result.get('highlights', []),
+            'concerns': result.get('concerns', []),
+        }
+
     def to_dict(self):
+        decision = self._decision_summary()
         return {
             'id': self.id,
             'candidateName': self.candidate_name,
             'candidateEmail': self.candidate_email,
             'candidatePhone': self.candidate_phone,
             'status': self.status,
+            'workflowStatus': self.workflow_status or 'new',
+            'hrNote': self.hr_note or '',
+            'jobDescription': self.job_description or '',
             'aiResult': self.ai_result,
             'evaluationResult': self.evaluation_result,
+            **decision,
             'profileId': self.profile_id,
             'profileName': self.profile.name if self.profile else None,
             'uploaderId': self.user_id,
@@ -155,11 +190,16 @@ class Resume(db.Model):
         }
 
     def to_dict_light(self):
+        decision = self._decision_summary()
         return {
             'id': self.id,
             'candidateName': self.candidate_name,
             'status': self.status,
+            'workflowStatus': self.workflow_status or 'new',
+            'hrNote': self.hr_note or '',
+            'jobDescription': self.job_description or '',
             'aiResult': self.ai_result,
+            **decision,
             'profileId': self.profile_id,
             'profileName': self.profile.name if self.profile else None,
             'uploadTime': self.upload_time.isoformat() if self.upload_time else None,

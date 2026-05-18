@@ -60,6 +60,7 @@ export default function ResumeReviewPage() {
   const [records, setRecords] = useState([])
   const [selectedProfile, setSelectedProfile] = useState('')
   const [file, setFile] = useState(null)
+  const [jobDescription, setJobDescription] = useState('')
   const [resumeId, setResumeId] = useState(null)
   const [status, setStatus] = useState(null)
   const [evaluation, setEvaluation] = useState(null)
@@ -124,9 +125,12 @@ export default function ResumeReviewPage() {
       const formData = new FormData()
       formData.append('file', file)
       formData.append('profileId', selectedProfile)
+      formData.append('jobDescription', jobDescription)
+      formData.append('autoEvaluate', 'true')
       const res = await api.post('/upload', formData)
       setResumeId(res.data.id)
-      setStatus('pending')
+      setStatus(res.data.status || 'evaluating')
+      setPolling((res.data.status || 'evaluating') === 'evaluating')
       await loadRecords()
     } catch (err) {
       setError(err.response?.data?.error || '上传失败')
@@ -216,6 +220,16 @@ export default function ResumeReviewPage() {
             />
           </div>
         </div>
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-slate-700 mb-1">岗位需求/JD（可选，但推荐填写）</label>
+          <textarea
+            value={jobDescription}
+            onChange={e => setJobDescription(e.target.value)}
+            rows={4}
+            placeholder="粘贴岗位职责、必备技能、加分项、薪资范围等。填写后会按JD匹配度生成面试建议。"
+            className="w-full px-3 py-2 rounded-lg border border-slate-300 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-200 outline-none resize-none"
+          />
+        </div>
 
         <div className="flex gap-2">
           {!resumeId && (
@@ -225,7 +239,7 @@ export default function ResumeReviewPage() {
               className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-medium disabled:opacity-50 flex items-center gap-2"
             >
               {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-              上传简历
+              上传并评估
             </button>
           )}
           {resumeId && status === 'pending' && (

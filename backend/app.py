@@ -72,8 +72,28 @@ def _init_default_data():
     db.session.commit()
 
 
+def _ensure_runtime_columns():
+    """SQLite create_all does not add columns; keep local installs forward-compatible."""
+    if database_type != 'sqlite':
+        return
+
+    from sqlalchemy import inspect, text
+    inspector = inspect(db.engine)
+    resume_columns = {column['name'] for column in inspector.get_columns('resume')}
+    column_specs = {
+        'workflow_status': "VARCHAR(50) DEFAULT 'new'",
+        'hr_note': 'TEXT',
+        'job_description': 'TEXT',
+    }
+    for column, spec in column_specs.items():
+        if column not in resume_columns:
+            db.session.execute(text(f'ALTER TABLE resume ADD COLUMN {column} {spec}'))
+    db.session.commit()
+
+
 with app.app_context():
     db.create_all()
+    _ensure_runtime_columns()
     _init_default_data()
 
 
@@ -115,6 +135,75 @@ def _validate_uploaded_document(filepath):
             pass
         return validation.get('message') or '文件无法解析，请检查文件格式'
     return None
+
+
+def _start_evaluation_task(resume):
+    task_token = uuid.uuid4().hex
+    resume.status = 'evaluating'
+    resume.evaluation_task_token = task_token
+    db.session.commit()
+
+    from ai_module.resume_evaluator import run_evaluation_in_background
+    thread = threading.Thread(
+        target=run_evaluation_in_background,
+        args=(app, db, resume.id, task_token),
+        daemon=True,
+    )
+    thread.start()
+
+    timeout_seconds = int(os.getenv('EVALUATION_TASK_TIMEOUT', '240'))
+    watchdog = threading.Timer(timeout_seconds, _mark_evaluation_timeout, args=(resume.id, task_token))
+    watchdog.daemon = True
+    watchdog.start()
+    return task_token
+
+
+def _mark_evaluation_timeout(resume_id, task_token):
+    with app.app_context():
+        resume = db.session.get(Resume, resume_id)
+        if not resume:
+            return
+        if resume.status == 'evaluating' and resume.evaluation_task_token == task_token:
+            resume.status = 'failed'
+            resume.workflow_status = 'needs_review'
+            resume.evaluation_error_message = '模型评估超时，已转入人工复核'
+            resume.evaluation_task_token = None
+            db.session.commit()
+
+
+def _extract_decision_fields(result):
+    result = result or {}
+    overall = result.get('overall_evaluation') or {}
+    overall_score = overall.get('overall_score')
+    match_score = result.get('match_score') if result.get('match_score') is not None else overall_score
+    risk_level = result.get('risk_level') or ''
+    if not risk_level:
+        risk_level = 'high' if (overall_score or 0) < 60 else 'medium' if (overall_score or 0) < 75 else 'low'
+    recommendation = result.get('recommendation') or ''
+    if not recommendation:
+        if risk_level == 'high':
+            recommendation = '建议人工复核'
+        elif (match_score or 0) >= 75:
+            recommendation = '推荐面试'
+        elif (match_score or 0) >= 60:
+            recommendation = '待定'
+        else:
+            recommendation = '建议淘汰'
+    highlights = result.get('highlights') or []
+    concerns = result.get('concerns') or []
+    questions = result.get('interview_questions') or []
+    evidence = result.get('evidence_snippets') or []
+    return {
+        'overallScore': overall.get('overall_score'),
+        'grade': overall.get('overall_grade'),
+        'matchScore': match_score,
+        'recommendation': recommendation,
+        'riskLevel': risk_level,
+        'highlights': highlights,
+        'concerns': concerns,
+        'interviewQuestions': questions,
+        'evidenceSnippets': evidence,
+    }
 
 
 @app.route('/api/login', methods=['POST'])
@@ -243,6 +332,7 @@ def download_report(id):
         return jsonify({'error': '暂无可下载报告'}), 404
 
     overall = (resume.evaluation_result or {}).get('overall_evaluation', {})
+    decision = _extract_decision_fields(resume.evaluation_result)
     dims = (resume.evaluation_result or {}).get('dimension_evaluations', [])
     dimension_labels = {
         'basic_info': '基本信息完整性',
@@ -269,7 +359,22 @@ def download_report(id):
         "",
         f"总分: {overall.get('overall_score', '')}",
         f"等级: {overall.get('overall_grade', '')}",
+        f"岗位匹配分: {decision.get('matchScore') or ''}",
+        f"建议动作: {decision.get('recommendation') or ''}",
+        f"风险等级: {decision.get('riskLevel') or ''}",
         f"综合反馈: {overall.get('overall_feedback', '')}",
+        "",
+        "候选人亮点:",
+        *[f"- {item}" for item in decision.get('highlights') or []],
+        "",
+        "主要短板/风险:",
+        *[f"- {item}" for item in decision.get('concerns') or []],
+        "",
+        "面试追问:",
+        *[f"- {item}" for item in decision.get('interviewQuestions') or []],
+        "",
+        "证据片段:",
+        *[f"- [{item.get('risk_type') or item.get('type') or '证据'}] {item.get('evidence', '')} -> {item.get('finding', '')}" for item in decision.get('evidenceSnippets') or [] if isinstance(item, dict)],
         "",
         "维度评分:",
     ]
@@ -315,15 +420,22 @@ def upload_resume():
 
     candidate_name = request.form.get('candidateName', '').strip() or os.path.splitext(file.filename)[0]
     profile_id = request.form.get('profileId', None, type=int)
+    job_description = request.form.get('jobDescription', '').strip()
+    auto_evaluate = request.form.get('autoEvaluate', 'false').lower() == 'true'
 
     resume = Resume(
         user_id=user.id,
         candidate_name=candidate_name,
         resume_url=filepath,
         profile_id=profile_id,
+        job_description=job_description,
+        workflow_status='new',
     )
     db.session.add(resume)
     db.session.commit()
+
+    if auto_evaluate:
+        _start_evaluation_task(resume)
 
     return jsonify(resume.to_dict())
 
@@ -339,6 +451,8 @@ def batch_upload():
         return jsonify({'error': '请上传文件'}), 400
 
     profile_id = request.form.get('profileId', None, type=int)
+    job_description = request.form.get('jobDescription', '').strip()
+    auto_evaluate = request.form.get('autoEvaluate', 'true').lower() != 'false'
     upload_dir = os.path.join(STORAGE_PATH, UPLOAD_FOLDER)
     os.makedirs(upload_dir, exist_ok=True)
 
@@ -366,11 +480,16 @@ def batch_upload():
             candidate_name=os.path.splitext(file.filename)[0],
             resume_url=filepath,
             profile_id=profile_id,
+            job_description=job_description,
+            workflow_status='new',
         )
         db.session.add(resume)
         results.append(resume)
 
     db.session.commit()
+    if auto_evaluate:
+        for resume in [r for r in results if isinstance(r, Resume)]:
+            _start_evaluation_task(resume)
     return jsonify({
         'resumes': [r.to_dict_light() for r in results if isinstance(r, Resume)],
         'failed': [r for r in results if isinstance(r, dict)],
@@ -389,20 +508,34 @@ def evaluate_resume(id):
     if resume.status in ['evaluating', 'completed']:
         return jsonify({'error': f'简历状态为 {resume.status}，无法重复评审'}), 400
 
-    task_token = uuid.uuid4().hex
-    resume.status = 'evaluating'
-    resume.evaluation_task_token = task_token
-    db.session.commit()
-
-    from ai_module.resume_evaluator import run_evaluation_in_background
-    thread = threading.Thread(
-        target=run_evaluation_in_background,
-        args=(app, db, id, task_token),
-        daemon=True,
-    )
-    thread.start()
+    data = request.json or {}
+    if isinstance(data, dict) and data.get('jobDescription') is not None:
+        resume.job_description = (data.get('jobDescription') or '').strip()
+        db.session.commit()
+    task_token = _start_evaluation_task(resume)
 
     return jsonify({'status': 'evaluating', 'taskToken': task_token})
+
+
+@app.route('/api/resumes/<int:id>/workflow', methods=['PUT'])
+def update_resume_workflow(id):
+    err = _require_login()
+    if err: return err
+    resume = db.session.get(Resume, id)
+    if not resume:
+        return jsonify({'error': '简历不存在'}), 404
+
+    data = request.json or {}
+    allowed = {'new', 'shortlisted', 'needs_review', 'rejected', 'archived'}
+    workflow_status = data.get('workflowStatus')
+    if workflow_status is not None:
+        if workflow_status not in allowed:
+            return jsonify({'error': '处理状态无效'}), 400
+        resume.workflow_status = workflow_status
+    if data.get('hrNote') is not None:
+        resume.hr_note = data.get('hrNote') or ''
+    db.session.commit()
+    return jsonify(resume.to_dict())
 
 
 @app.route('/api/resumes/<int:id>/detailed-review', methods=['POST'])
@@ -711,17 +844,25 @@ def export_scores():
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "简历评审评分表"
-    headers = ['序号', '候选人', '评审模板', '总分', '等级', '评审时间', '风险数']
+    headers = ['序号', '候选人', '评审模板', '总分', '等级', '岗位匹配分', '建议动作', '风险等级', '处理状态', '核心亮点', '主要短板', 'HR备注', '评审时间', '风险数']
     ws.append(headers)
 
     for i, r in enumerate(resumes, 1):
         result = r.evaluation_result or {}
         overall = result.get('overall_evaluation', {})
+        decision = _extract_decision_fields(result)
         ws.append([
             i, r.candidate_name or '',
             r.profile.name if r.profile else '',
             overall.get('overall_score', ''),
             overall.get('overall_grade', ''),
+            decision.get('matchScore') or '',
+            decision.get('recommendation') or '',
+            decision.get('riskLevel') or '',
+            r.workflow_status or 'new',
+            '；'.join(decision.get('highlights') or []),
+            '；'.join(decision.get('concerns') or []),
+            r.hr_note or '',
             r.evaluation_time.isoformat() if r.evaluation_time else '',
             r.risk_flag_count or 0,
         ])
