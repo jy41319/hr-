@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from datetime import datetime
 
 from .document_reader import get_document_reader
+from .llm_config import normalize_temperature
 from .resume_structure import get_resume_structure_extractor, save_structure_debug
 from .token_counter import count_tokens, accumulate_model_tokens, extract_token_usage
 from . import resume_prompts
@@ -57,7 +58,7 @@ class ResumeEvaluator:
             model_name=self.model_name,
             openai_api_key=self.api_key,
             openai_api_base=self.api_base,
-            temperature=0.5,
+            temperature=normalize_temperature(self.model_name, 0.5),
             **llm_kwargs,
         )
 
@@ -66,7 +67,7 @@ class ResumeEvaluator:
                 model_name=self.model_name,
                 openai_api_key=self.api_key,
                 openai_api_base=self.api_base,
-                temperature=0.5,
+                temperature=normalize_temperature(self.model_name, 0.5),
             )
         else:
             self.llm_structured = self.llm

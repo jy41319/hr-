@@ -9,6 +9,7 @@ from datetime import datetime
 
 from .token_counter import count_tokens, accumulate_model_tokens, extract_token_usage
 from .document_reader import get_document_reader
+from .llm_config import normalize_temperature
 
 
 class PositionClassification(BaseModel):
@@ -28,7 +29,7 @@ def _get_llm() -> Optional[ChatOpenAI]:
             model_name=active_model.model_name,
             openai_api_key=active_model.api_key,
             openai_api_base=active_model.api_base,
-            temperature=0.1,
+            temperature=normalize_temperature(active_model.model_name, 0.1),
         )
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -41,7 +42,7 @@ def _get_llm() -> Optional[ChatOpenAI]:
         model_name=model_name,
         openai_api_key=api_key,
         openai_api_base=api_base,
-        temperature=0.1,
+        temperature=normalize_temperature(model_name, 0.1),
     )
 
 

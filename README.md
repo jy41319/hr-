@@ -70,9 +70,9 @@ hr-resume-bot/
    在项目根目录创建 `.env` 文件（参考 `.env.example`）：
    ```env
    # AI 模型配置
-   OPENAI_API_KEY="sk-..."
-   OPENAI_API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
-   OPENAI_MODEL_NAME="qwen-max"
+   OPENAI_API_KEY="sk-your-kimi-api-key"
+   OPENAI_API_BASE="https://api.moonshot.cn/v1"
+   OPENAI_MODEL_NAME="kimi-k2.6"
    
    # Flask
    SECRET_KEY=your-secret-key
