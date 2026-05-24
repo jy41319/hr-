@@ -1,8 +1,10 @@
 """
-数据库模型定义 - HR智能审稿机器人
+数据库模型定义 - CVizr
 """
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
+import hashlib
+import re
 
 db = SQLAlchemy()
 
@@ -92,8 +94,12 @@ class Resume(db.Model):
     resume_url = db.Column(db.String(300), nullable=False)
 
     status = db.Column(db.String(50), default='pending')
+    evaluation_stage = db.Column(db.String(50), nullable=True)
+    evaluation_progress = db.Column(db.Integer, default=0)
+    evaluation_status_message = db.Column(db.String(300), nullable=True)
     workflow_status = db.Column(db.String(50), default='new')
     hr_note = db.Column(db.Text, nullable=True)
+    job_name = db.Column(db.String(120), nullable=True)
     job_description = db.Column(db.Text, nullable=True)
     ai_result = db.Column(db.String(10), nullable=True)
     evaluation_result = db.Column(db.JSON, nullable=True)
@@ -135,6 +141,7 @@ class Resume(db.Model):
         overall = result.get('overall_evaluation', {})
         overall_score = overall.get('overall_score')
         match_score = result.get('match_score') if result.get('match_score') is not None else overall_score
+        match_grade = result.get('match_grade') or self._grade_from_score(match_score)
         risk_level = result.get('risk_level')
         if not risk_level:
             risk_level = 'high' if (overall_score or 0) < 60 else 'medium' if (overall_score or 0) < 75 else 'low'
@@ -151,11 +158,71 @@ class Resume(db.Model):
         return {
             'overallScore': overall_score,
             'matchScore': match_score,
+            'matchGrade': match_grade,
             'recommendation': recommendation if self.evaluation_result else None,
             'riskLevel': risk_level if self.evaluation_result else None,
             'highlights': result.get('highlights', []),
             'concerns': result.get('concerns', []),
+            'recommendationReason': result.get('recommendation_reason'),
+            'candidateProfileSummary': result.get('candidate_profile_summary'),
+            'candidateBasicInfo': result.get('candidate_basic_info', {}),
+            'keyGaps': result.get('key_gaps', []),
+            'requirementMatches': result.get('requirement_matches', []),
+            'scoreBreakdown': result.get('score_breakdown', {}),
+            'jdCriteria': result.get('jd_criteria', {}),
         }
+
+    @staticmethod
+    def _grade_from_score(score):
+        try:
+            value = float(score or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value >= 90:
+            return 'A'
+        if value >= 80:
+            return 'B'
+        if value >= 70:
+            return 'C'
+        if value >= 60:
+            return 'D'
+        return 'E'
+
+    @staticmethod
+    def _normalize_job_description(text):
+        return re.sub(r'\s+', ' ', (text or '').strip()).lower()
+
+    @staticmethod
+    def _clip_text(text, limit=24):
+        cleaned = re.sub(r'\s+', ' ', (text or '').strip())
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[:limit].rstrip() + '...'
+
+    def _job_key(self):
+        normalized = self._normalize_job_description(self.job_description)
+        if normalized:
+            digest = hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:12]
+            return f'jd_{digest}'
+        if self.profile_id:
+            return f'profile_{self.profile_id}'
+        return 'no_jd'
+
+    def _job_display_name(self):
+        if self.job_name:
+            return self._clip_text(self.job_name, 32)
+        first_line = next((line.strip() for line in (self.job_description or '').splitlines() if line.strip()), '')
+        if first_line:
+            return self._clip_text(first_line, 18)
+        if self.profile:
+            return self.profile.name
+        return '通用初筛任务'
+
+    def _job_summary(self):
+        first_line = next((line.strip() for line in (self.job_description or '').splitlines() if line.strip()), '')
+        if first_line:
+            return self._clip_text(first_line, 60)
+        return self.profile.name if self.profile else '未填写JD，使用通用初筛标准'
 
     def to_dict(self):
         decision = self._decision_summary()
@@ -165,8 +232,14 @@ class Resume(db.Model):
             'candidateEmail': self.candidate_email,
             'candidatePhone': self.candidate_phone,
             'status': self.status,
+            'evaluationStage': self.evaluation_stage,
+            'evaluationProgress': self.evaluation_progress or 0,
+            'evaluationStatusMessage': self.evaluation_status_message or '',
             'workflowStatus': self.workflow_status or 'new',
             'hrNote': self.hr_note or '',
+            'jobName': self._job_display_name(),
+            'jobKey': self._job_key(),
+            'jobSummary': self._job_summary(),
             'jobDescription': self.job_description or '',
             'aiResult': self.ai_result,
             'evaluationResult': self.evaluation_result,
@@ -195,8 +268,14 @@ class Resume(db.Model):
             'id': self.id,
             'candidateName': self.candidate_name,
             'status': self.status,
+            'evaluationStage': self.evaluation_stage,
+            'evaluationProgress': self.evaluation_progress or 0,
+            'evaluationStatusMessage': self.evaluation_status_message or '',
             'workflowStatus': self.workflow_status or 'new',
             'hrNote': self.hr_note or '',
+            'jobName': self._job_display_name(),
+            'jobKey': self._job_key(),
+            'jobSummary': self._job_summary(),
             'jobDescription': self.job_description or '',
             'aiResult': self.ai_result,
             **decision,

@@ -1,22 +1,226 @@
 @import "tailwindcss";
 
 :root {
-  --primary: #4f46e5;
-  --primary-light: #818cf8;
-  --primary-dark: #3730a3;
+  --primary: #2563eb;
+  --primary-light: #60a5fa;
+  --primary-dark: #172554;
   --accent: #06b6d4;
   --danger: #ef4444;
   --warning: #f59e0b;
   --success: #10b981;
-  --surface: #f8fafc;
-  --surface-dark: #1e293b;
+  --ink: #0f172a;
+  --muted: #64748b;
+  --glass: rgba(255, 255, 255, 0.72);
+  --glass-strong: rgba(255, 255, 255, 0.88);
+  --glass-border: rgba(255, 255, 255, 0.72);
+  --glass-shadow: 0 24px 70px rgba(15, 23, 42, 0.10);
+  --ease-smooth: cubic-bezier(.2, .8, .2, 1);
 }
 
 body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", sans-serif;
+  color: var(--ink);
   background:
-    radial-gradient(circle at top left, rgba(14, 165, 233, 0.10), transparent 32rem),
-    linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+    radial-gradient(circle at 16% 8%, rgba(56, 189, 248, 0.23), transparent 28rem),
+    radial-gradient(circle at 88% 12%, rgba(99, 102, 241, 0.16), transparent 26rem),
+    radial-gradient(circle at 55% 92%, rgba(16, 185, 129, 0.12), transparent 26rem),
+    linear-gradient(135deg, #f8fafc 0%, #edf4fb 48%, #f7fbff 100%);
+  min-height: 100vh;
+}
+
+button, a, select, textarea, input {
+  transition:
+    transform .22s var(--ease-smooth),
+    box-shadow .22s var(--ease-smooth),
+    border-color .22s var(--ease-smooth),
+    background-color .22s var(--ease-smooth),
+    opacity .22s var(--ease-smooth);
+}
+
+button:active, a:active {
+  transform: scale(0.985);
+}
+
+button:focus-visible, a:focus-visible, select:focus-visible, textarea:focus-visible, input:focus-visible {
+  outline: 2px solid rgba(14, 165, 233, 0.46);
+  outline-offset: 3px;
+}
+
+.app-shell {
+  background:
+    linear-gradient(115deg, rgba(255, 255, 255, 0.30), rgba(255, 255, 255, 0.08)),
+    transparent;
+}
+
+.glass-card {
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.58));
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  border-radius: 1.25rem;
+}
+
+.glass-card:hover {
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.13);
+}
+
+.glass-control {
+  background: rgba(255, 255, 255, 0.64);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.76);
+}
+
+.glass-sidebar {
+  background:
+    radial-gradient(circle at 50% 0%, rgba(56, 189, 248, 0.22), transparent 18rem),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(15, 23, 42, 0.90));
+  border-right: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 18px 0 60px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
+
+.glass-header {
+  border-bottom: 1px solid rgba(255,255,255,.64);
+  background: rgba(255,255,255,.68);
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.05);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+
+.nav-glass-link {
+  position: relative;
+}
+
+.nav-glass-link:hover {
+  background: rgba(255, 255, 255, 0.08);
+  transform: translateX(2px);
+}
+
+.nav-glass-link.is-active {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.92), rgba(6, 182, 212, 0.82));
+  box-shadow: 0 14px 36px rgba(37, 99, 235, 0.28), inset 0 1px 0 rgba(255,255,255,.28);
+}
+
+.btn-primary,
+.btn-success,
+.btn-danger,
+.btn-ghost,
+.btn-sidebar {
+  border-radius: 0.9rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .45rem;
+}
+
+.btn-primary {
+  color: white;
+  background: linear-gradient(135deg, #2563eb, #06b6d4);
+  box-shadow: 0 14px 34px rgba(37, 99, 235, 0.28), inset 0 1px 0 rgba(255,255,255,.30);
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 18px 42px rgba(37, 99, 235, 0.34), inset 0 1px 0 rgba(255,255,255,.36);
+}
+
+.btn-success {
+  color: white;
+  background: linear-gradient(135deg, #059669, #10b981);
+  box-shadow: 0 12px 30px rgba(16, 185, 129, 0.22);
+}
+
+.btn-danger {
+  color: white;
+  background: linear-gradient(135deg, #dc2626, #fb7185);
+  box-shadow: 0 12px 30px rgba(239, 68, 68, 0.20);
+}
+
+.btn-ghost,
+.btn-sidebar {
+  color: #334155;
+  background: rgba(255,255,255,.62);
+  border: 1px solid rgba(255,255,255,.70);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.70);
+}
+
+.btn-sidebar {
+  color: #cbd5e1;
+  background: rgba(255,255,255,.06);
+  border-color: rgba(255,255,255,.10);
+  width: 100%;
+}
+
+.btn-ghost:hover {
+  transform: translateY(-1px);
+  background: rgba(255,255,255,.86);
+}
+
+.chip-button {
+  border-radius: 999px;
+  background: rgba(255,255,255,.58);
+  color: #475569;
+  border: 1px solid rgba(255,255,255,.72);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.72);
+}
+
+.chip-button:hover {
+  background: rgba(255,255,255,.86);
+  transform: translateY(-1px);
+}
+
+.chip-button.is-active {
+  color: white;
+  background: linear-gradient(135deg, #0f172a, #2563eb);
+  box-shadow: 0 12px 28px rgba(37, 99, 235, 0.22);
+}
+
+.motion-panel {
+  animation: page-in .42s var(--ease-smooth) both;
+}
+
+.animate-progress-reveal {
+  transform-origin: top;
+  animation: progress-reveal .28s var(--ease-smooth) both;
+}
+
+.candidate-detail-modal {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.90));
+  backdrop-filter: blur(24px) saturate(145%);
+  -webkit-backdrop-filter: blur(24px) saturate(145%);
+  box-shadow:
+    0 32px 90px rgba(15, 23, 42, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.80);
+}
+
+.floating-back-button {
+  left: max(1rem, calc(var(--sidebar-width, 15rem) + 1.5rem));
+  bottom: max(1.25rem, env(safe-area-inset-bottom));
+}
+
+.progress-stripe {
+  background-size: 220% 100%;
+  box-shadow: 0 8px 24px rgba(37, 99, 235, .24);
+  transition: width .65s var(--ease-smooth);
+  animation: progress-flow 1.8s linear infinite;
+}
+
+@keyframes page-in {
+  from { opacity: 0; transform: translateY(8px) scale(.995); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes progress-reveal {
+  from { opacity: 0; transform: translateY(-6px) scaleY(.96); }
+  to { opacity: 1; transform: translateY(0) scaleY(1); }
+}
+
+@keyframes progress-flow {
+  from { background-position: 0% 50%; }
+  to { background-position: 220% 50%; }
 }
 
 .grade-badge {
@@ -44,4 +248,29 @@ body {
 
 .screening-console ::selection {
   background: rgba(79, 70, 229, 0.16);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+  }
+
+  button:active, a:active {
+    transform: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .glass-card,
+  .glass-header,
+  .btn-ghost,
+  .chip-button {
+    background: #fff;
+    border-color: #94a3b8;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
 }

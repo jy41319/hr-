@@ -28,14 +28,14 @@ export default function LoginPage() {
         <div className="flex items-center gap-3 mb-6">
           <ShieldAlert className="w-10 h-10 text-indigo-600" />
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">智能审稿机器人</h1>
-            <p className="text-sm text-slate-500">HR提效 · 文档审查</p>
+            <h1 className="text-2xl font-bold text-slate-900">CVizr</h1>
+            <p className="text-sm text-slate-500">CV 可视化初筛 · JD 驱动决策</p>
           </div>
         </div>
 
         <p className="text-slate-600 mb-6">
-          HR同学的审稿神器！瞬间识别简历中的错别字、格式问题、逻辑漏洞，
-          还能自动标记风险点。从2小时的繁琐审阅压缩到5分钟，让招聘效率起飞！
+          为 HR 把 CV、岗位 JD 与风险证据清晰可视化：批量排序候选人、解释匹配依据，
+          从2小时的繁琐审阅压缩到5分钟，让招聘效率起飞！
         </p>
 
         {error && <div className="bg-red-50 text-red-700 px-4 py-2 rounded-lg mb-4 text-sm">{error}</div>}

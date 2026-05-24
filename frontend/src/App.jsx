@@ -6,6 +6,7 @@ import LoginPage from './pages/LoginPage'
 import ChatPage from './pages/ChatPage'
 import ResumeReviewPage from './pages/ResumeReviewPage'
 import BatchReviewPage from './pages/BatchReviewPage'
+import TalentPoolPage from './pages/TalentPoolPage'
 import ReportPage from './pages/ReportPage'
 import AigcDetectionPage from './pages/AigcDetectionPage'
 import RiskMapPage from './pages/RiskMapPage'
@@ -41,6 +42,7 @@ export default function App() {
           <Route index element={<ChatPage />} />
           <Route path="review" element={<ResumeReviewPage />} />
           <Route path="batch" element={<BatchReviewPage />} />
+          <Route path="talent-pool" element={<TalentPoolPage />} />
           <Route path="report/:id" element={<ReportPage />} />
           <Route path="aigc/:id" element={<AigcDetectionPage />} />
           <Route path="risk/:id" element={<RiskMapPage />} />

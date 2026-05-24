@@ -71,7 +71,11 @@ export default function AigcDetectionPage() {
   }
 
   if (error) {
-    return <div className="bg-red-50 text-red-700 px-4 py-3 rounded-lg">{error}</div>
+    return (
+      <div className="max-w-4xl mx-auto space-y-4">
+        <div className="bg-red-50 text-red-700 px-4 py-3 rounded-lg">{error}</div>
+      </div>
+    )
   }
 
   const overallScore = detections?.overall_aigc_score ?? detections?.aigc_score ?? 0
@@ -83,7 +87,9 @@ export default function AigcDetectionPage() {
 
   return (
     <div className="max-w-4xl mx-auto">
-      <h2 className="text-xl font-bold text-slate-800 mb-6">AIGC检测报告</h2>
+      <div className="mb-6 flex flex-col gap-3">
+        <h2 className="text-xl font-bold text-slate-800">AIGC检测报告</h2>
+      </div>
 
       {resume && (
         <div className="bg-white rounded-xl border border-slate-200 p-4 mb-6">

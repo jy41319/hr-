@@ -1,7 +1,8 @@
 """
-HR智能审稿机器人 - Flask主应用
+CVizr - Flask主应用
 """
 import os
+import re
 import uuid
 import threading
 from datetime import datetime
@@ -39,6 +40,10 @@ os.makedirs(os.path.join(STORAGE_PATH, UPLOAD_FOLDER), exist_ok=True)
 
 db.init_app(app)
 Session(app)
+
+EVALUATION_CONCURRENCY = int(os.getenv('EVALUATION_CONCURRENCY', '2'))
+evaluation_semaphore = threading.BoundedSemaphore(max(1, EVALUATION_CONCURRENCY))
+evaluation_task_started_at = {}
 
 
 def _init_default_data():
@@ -81,8 +86,12 @@ def _ensure_runtime_columns():
     inspector = inspect(db.engine)
     resume_columns = {column['name'] for column in inspector.get_columns('resume')}
     column_specs = {
+        'evaluation_stage': 'VARCHAR(50)',
+        'evaluation_progress': 'INTEGER DEFAULT 0',
+        'evaluation_status_message': 'VARCHAR(300)',
         'workflow_status': "VARCHAR(50) DEFAULT 'new'",
         'hr_note': 'TEXT',
+        'job_name': 'VARCHAR(120)',
         'job_description': 'TEXT',
     }
     for column, spec in column_specs.items():
@@ -137,24 +146,139 @@ def _validate_uploaded_document(filepath):
     return None
 
 
+def _first_match(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" ｜|，,;；")
+    return ''
+
+
+def _infer_candidate_basic_info(resume):
+    """Best-effort fallback for old reports generated before candidate_basic_info existed."""
+    existing = (resume.evaluation_result or {}).get('candidate_basic_info') or {}
+    if existing and any(str(value or '').strip() for value in existing.values()):
+        return existing
+
+    text = _read_resume_text_safely(resume)
+
+    school = major = education = ''
+    school_line = _first_match(text, [
+        r'院校学历[：:]\s*([^\n]+)',
+        r'教育背景[：:]\s*([^\n]+)',
+    ])
+    if school_line:
+        parts = [part.strip() for part in re.split(r'[/／｜|]', school_line) if part.strip()]
+        if len(parts) >= 1:
+            school = parts[0]
+        if len(parts) >= 2:
+            major = parts[1]
+        if len(parts) >= 3:
+            education = parts[2]
+
+    return {
+        'age': _first_match(text, [r'年龄[：:]\s*(\d{1,2}\s*岁?)', r'(\d{1,2}\s*岁)']),
+        'gender': _first_match(text, [r'性别[：:]\s*([男女])']),
+        'education': education or _first_match(text, [r'学历[：:]\s*([^\n｜|/／]+)', r'(本科|硕士|博士|大专)']),
+        'school': school or _first_match(text, [r'(?:学校|院校)[：:]\s*([^\n｜|/／]+)']),
+        'major': major or _first_match(text, [r'专业[：:]\s*([^\n｜|/／]+)']),
+        'graduation_year': _first_match(text, [r'毕业(?:时间|年份)?[：:]\s*([0-9]{4}(?:\.[0-9]{1,2})?)', r'([0-9]{4}\s*届)']),
+        'city': _first_match(text, [r'城市[：:]\s*([^\n｜|，,]+)', r'(?:所在城市|期望城市)[：:]\s*([^\n｜|，,]+)']),
+        'work_years': _first_match(text, [r'工作年限[：:]\s*([^\n｜|，,]+)', r'(\d+\s*年(?:工作|实习)?经验)']),
+        'expected_salary': _first_match(text, [r'期望薪资[：:]\s*([^\n｜|，,]+)']),
+        'phone': resume.candidate_phone or _first_match(text, [r'(1[3-9]\d[-\s]?\d{4}[-\s]?\d{4})']),
+        'email': resume.candidate_email or _first_match(text, [r'([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})']),
+    }
+
+
+def _read_resume_text_safely(resume):
+    try:
+        from ai_module.document_reader import get_document_reader
+        return get_document_reader().read(resume.resume_url)
+    except Exception:
+        return ''
+
+
+def _fallback_dimension_evidence_from_text(text, dimension_key, dimension_payload=None):
+    lines = [
+        line.strip(" -•\t")
+        for line in re.split(r"[\n\r]+", text or "")
+        if len(line.strip()) >= 6
+    ]
+    lines = [
+        line for line in lines
+        if "模拟测试数据" not in line and "以下姓名、经历、联系方式均为虚构" not in line
+    ]
+    keyword_map = {
+        "basic_info": r"姓名|性别|年龄|城市|手机|电话|邮箱|院校|学历|专业|毕业|薪资",
+        "format": r"基本信息|个人摘要|核心技能|工作|实习|项目|教育|经历|补充说明",
+        "work_logic": r"工作|实习|经历|负责|项目|20\d{2}|至今|公司|团队|部门",
+        "skill_match": r"技能|能力|工具|Python|SQL|Java|前端|后端|AI|AIGC|Prompt|RAG|产品|运营|设计|数据|剪辑|小红书",
+        "risk_assessment": r"风险|待确认|补充说明|毕业时间|期望薪资|未体现|不符|缺少|疑似|模拟风险",
+        "overall_impression": r"个人摘要|核心技能|工作|实习|项目|负责|成果|获得|排名|优化|提升",
+    }
+    pattern = keyword_map.get(dimension_key, keyword_map["overall_impression"])
+    matched = [line for line in lines if re.search(pattern, line, re.IGNORECASE)]
+    selected = (matched or lines)[:3]
+    payload = dimension_payload or {}
+    summary_source = payload.get("strengths") or payload.get("weaknesses") or payload.get("feedback") or "维度判断"
+    summary = re.split(r"[。；;\n]", str(summary_source).strip())[0][:80] or "维度判断"
+    return [{"summary": summary, "evidence": line[:260]} for line in selected]
+
+
+def _enrich_evaluation_for_report(resume):
+    result = dict(resume.evaluation_result or {})
+    if not result:
+        return result
+    text = ''
+    if not result.get('candidate_basic_info'):
+        result['candidate_basic_info'] = _infer_candidate_basic_info(resume)
+    dimensions = result.get('dimension_evaluations')
+    if isinstance(dimensions, dict):
+        for key, payload in dimensions.items():
+            if not isinstance(payload, dict):
+                continue
+            if payload.get('evidence_quotes'):
+                continue
+            if not text:
+                text = _read_resume_text_safely(resume)
+            payload['evidence_quotes'] = _fallback_dimension_evidence_from_text(text, key, payload)
+    return result
+
+
 def _start_evaluation_task(resume):
+    resume_id = resume.id
     task_token = uuid.uuid4().hex
+    evaluation_task_started_at[task_token] = datetime.utcnow()
     resume.status = 'evaluating'
+    resume.evaluation_stage = 'queued'
+    resume.evaluation_progress = 5
+    resume.evaluation_status_message = '任务已提交，正在等待评估资源'
+    resume.evaluation_error_message = None
     resume.evaluation_task_token = task_token
     db.session.commit()
 
     from ai_module.resume_evaluator import run_evaluation_in_background
+
+    def _queued_evaluation_runner():
+        with evaluation_semaphore:
+            # Start the watchdog only after the job leaves the queue, so later
+            # batch items do not time out before they actually start.
+            timeout_seconds = int(os.getenv('EVALUATION_TASK_TIMEOUT', '480'))
+            watchdog = threading.Timer(timeout_seconds, _mark_evaluation_timeout, args=(resume_id, task_token))
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                run_evaluation_in_background(app, db, resume_id, task_token)
+            finally:
+                watchdog.cancel()
+                evaluation_task_started_at.pop(task_token, None)
+
     thread = threading.Thread(
-        target=run_evaluation_in_background,
-        args=(app, db, resume.id, task_token),
+        target=_queued_evaluation_runner,
         daemon=True,
     )
     thread.start()
-
-    timeout_seconds = int(os.getenv('EVALUATION_TASK_TIMEOUT', '240'))
-    watchdog = threading.Timer(timeout_seconds, _mark_evaluation_timeout, args=(resume.id, task_token))
-    watchdog.daemon = True
-    watchdog.start()
     return task_token
 
 
@@ -165,10 +289,60 @@ def _mark_evaluation_timeout(resume_id, task_token):
             return
         if resume.status == 'evaluating' and resume.evaluation_task_token == task_token:
             resume.status = 'failed'
+            resume.evaluation_stage = 'timeout'
+            resume.evaluation_progress = 100
+            resume.evaluation_status_message = '模型评估超时，已转入人工复核'
             resume.workflow_status = 'needs_review'
             resume.evaluation_error_message = '模型评估超时，已转入人工复核'
             resume.evaluation_task_token = None
+            evaluation_task_started_at.pop(task_token, None)
             db.session.commit()
+
+
+def _release_stale_evaluations(scope_query=None):
+    """Release orphaned evaluating rows left behind by killed/restarted workers."""
+    stale_seconds = int(os.getenv('EVALUATION_STALE_SECONDS', str(max(540, int(os.getenv('EVALUATION_TASK_TIMEOUT', '480')) + 60))))
+    cutoff = datetime.utcnow().timestamp() - stale_seconds
+    query = scope_query or Resume.query
+    stale_resumes = query.filter(
+        Resume.status == 'evaluating',
+        Resume.evaluation_stage != 'queued',
+    ).all()
+    changed = False
+    for resume in stale_resumes:
+        stale_token = resume.evaluation_task_token
+        started_at = evaluation_task_started_at.get(stale_token)
+        reference_time = started_at or resume.upload_time
+        if not reference_time or reference_time.timestamp() > cutoff:
+            continue
+        resume.status = 'failed'
+        resume.workflow_status = resume.workflow_status or 'needs_review'
+        resume.evaluation_stage = 'timeout'
+        resume.evaluation_progress = 100
+        resume.evaluation_status_message = '评估任务长时间未更新，已自动转为待重新评估'
+        resume.evaluation_error_message = '评估任务长时间未更新，可能是模型请求超时或后端重启导致。'
+        resume.evaluation_task_token = None
+        if stale_token:
+            evaluation_task_started_at.pop(stale_token, None)
+        changed = True
+    if changed:
+        db.session.commit()
+
+
+def _grade_from_score(score):
+    try:
+        value = float(score or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value >= 90:
+        return 'A'
+    if value >= 80:
+        return 'B'
+    if value >= 70:
+        return 'C'
+    if value >= 60:
+        return 'D'
+    return 'E'
 
 
 def _extract_decision_fields(result):
@@ -176,6 +350,7 @@ def _extract_decision_fields(result):
     overall = result.get('overall_evaluation') or {}
     overall_score = overall.get('overall_score')
     match_score = result.get('match_score') if result.get('match_score') is not None else overall_score
+    match_grade = result.get('match_grade') or _grade_from_score(match_score)
     risk_level = result.get('risk_level') or ''
     if not risk_level:
         risk_level = 'high' if (overall_score or 0) < 60 else 'medium' if (overall_score or 0) < 75 else 'low'
@@ -197,6 +372,7 @@ def _extract_decision_fields(result):
         'overallScore': overall.get('overall_score'),
         'grade': overall.get('overall_grade'),
         'matchScore': match_score,
+        'matchGrade': match_grade,
         'recommendation': recommendation,
         'riskLevel': risk_level,
         'highlights': highlights,
@@ -204,6 +380,240 @@ def _extract_decision_fields(result):
         'interviewQuestions': questions,
         'evidenceSnippets': evidence,
     }
+
+
+def _safe_export_name(value, fallback='candidate'):
+    safe = secure_filename(str(value or '').strip()) or fallback
+    return safe[:80]
+
+
+def _risk_label(value):
+    return {
+        'low': '低风险',
+        'medium': '中风险',
+        'high': '高风险',
+    }.get(value or '', value or '待确认')
+
+
+def _status_label(value):
+    return {
+        'met': '已满足',
+        'partial': '部分满足',
+        'missing': '缺失',
+        'unknown': '待确认',
+    }.get(value or '', value or '待确认')
+
+
+def _set_cell_shading(cell, fill):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = tc_pr.find(qn('w:shd'))
+    if shd is None:
+        shd = OxmlElement('w:shd')
+        tc_pr.append(shd)
+    shd.set(qn('w:fill'), fill)
+
+
+def _set_cell_text(cell, text, bold=False, color=None):
+    cell.text = ''
+    paragraph = cell.paragraphs[0]
+    run = paragraph.add_run(str(text or ''))
+    run.bold = bold
+    if color:
+        run.font.color.rgb = color
+    _apply_run_font(run)
+
+
+def _apply_run_font(run, east_asia='Microsoft YaHei'):
+    from docx.oxml.ns import qn
+    run.font.name = 'Aptos'
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), east_asia)
+
+
+def _add_doc_heading(document, text, level=1):
+    paragraph = document.add_heading('', level=level)
+    run = paragraph.add_run(text)
+    _apply_run_font(run)
+    return paragraph
+
+
+def _add_bullets(document, items, empty_text='暂无'):
+    values = [str(item).strip() for item in (items or []) if str(item).strip()]
+    if not values:
+        values = [empty_text]
+    for item in values:
+        paragraph = document.add_paragraph(style='List Bullet')
+        run = paragraph.add_run(item)
+        _apply_run_font(run)
+
+
+def _add_kv_table(document, pairs, columns=2):
+    from docx.shared import Cm, RGBColor
+    visible_pairs = [(label, value if value not in [None, ''] else '待确认') for label, value in pairs]
+    row_count = (len(visible_pairs) + columns - 1) // columns
+    table = document.add_table(rows=row_count, cols=columns * 2)
+    table.style = 'Table Grid'
+    table.autofit = False
+    widths = [Cm(2.3), Cm(5.0)] * columns
+    for row in table.rows:
+        for index, cell in enumerate(row.cells):
+            cell.width = widths[index]
+    for idx, (label, value) in enumerate(visible_pairs):
+        row = table.rows[idx // columns]
+        offset = (idx % columns) * 2
+        label_cell = row.cells[offset]
+        value_cell = row.cells[offset + 1]
+        _set_cell_shading(label_cell, 'EAF5FF')
+        _set_cell_text(label_cell, label, bold=True, color=RGBColor(51, 65, 85))
+        _set_cell_text(value_cell, value, color=RGBColor(15, 23, 42))
+    return table
+
+
+def _build_interview_summary_docx(resume):
+    from docx import Document
+    from docx.enum.section import WD_SECTION
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Cm, Pt, RGBColor
+    from docx.oxml.ns import qn
+
+    result = _enrich_evaluation_for_report(resume)
+    overall = result.get('overall_evaluation') or {}
+    decision = _extract_decision_fields(result)
+    candidate_info = result.get('candidate_basic_info') or _infer_candidate_basic_info(resume)
+    requirement_matches = result.get('requirement_matches') or []
+    evidence = result.get('evidence_snippets') or []
+    questions = result.get('interview_questions') or decision.get('interviewQuestions') or []
+    highlights = result.get('highlights') or decision.get('highlights') or []
+    concerns = result.get('concerns') or decision.get('concerns') or []
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Cm(1.7)
+    section.bottom_margin = Cm(1.7)
+    section.left_margin = Cm(1.8)
+    section.right_margin = Cm(1.8)
+
+    styles = document.styles
+    normal = styles['Normal']
+    normal.font.name = 'Aptos'
+    normal.font.size = Pt(10.5)
+    normal._element.rPr.rFonts.set(qn('w:eastAsia'), 'Microsoft YaHei')
+    for style_name, size, color in [
+        ('Title', 22, '0F172A'),
+        ('Heading 1', 14, '0E7490'),
+        ('Heading 2', 12, '334155'),
+    ]:
+        style = styles[style_name]
+        style.font.name = 'Aptos'
+        style.font.size = Pt(size)
+        style.font.color.rgb = RGBColor.from_string(color)
+        style._element.rPr.rFonts.set(qn('w:eastAsia'), 'Microsoft YaHei')
+
+    title = document.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_run = title.add_run('CVizr 面试摘要')
+    _apply_run_font(title_run)
+    title_run.bold = True
+    title_run.font.size = Pt(22)
+    title_run.font.color.rgb = RGBColor(15, 23, 42)
+
+    subtitle = document.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle_run = subtitle.add_run(f"{resume.candidate_name or '未命名候选人'} · {datetime.now().strftime('%Y-%m-%d')}")
+    _apply_run_font(subtitle_run)
+    subtitle_run.font.size = Pt(10.5)
+    subtitle_run.font.color.rgb = RGBColor(100, 116, 139)
+
+    document.add_paragraph()
+    _add_doc_heading(document, '一、快速决策', level=1)
+    _add_kv_table(document, [
+        ('建议动作', decision.get('recommendation') or '待确认'),
+        ('JD匹配分', f"{decision.get('matchScore') or '-'} / {decision.get('matchGrade') or '-'}"),
+        ('综合评分', f"{overall.get('overall_score', '-')} / {overall.get('overall_grade', '-')}"),
+        ('风险等级', _risk_label(decision.get('riskLevel'))),
+        ('处理状态', {'new': '未处理', 'shortlisted': '待面试', 'needs_review': '待复核', 'rejected': '已淘汰', 'archived': '已入库'}.get(resume.workflow_status, resume.workflow_status or '未处理')),
+        ('评估时间', resume.evaluation_time.strftime('%Y-%m-%d %H:%M') if resume.evaluation_time else '待确认'),
+    ])
+
+    reason = result.get('recommendation_reason') or overall.get('overall_feedback') or ''
+    if reason:
+        p = document.add_paragraph()
+        run = p.add_run(f"推荐理由：{reason}")
+        _apply_run_font(run)
+        run.bold = True
+        run.font.color.rgb = RGBColor(15, 23, 42)
+
+    _add_doc_heading(document, '二、候选人基本信息', level=1)
+    _add_kv_table(document, [
+        ('姓名', resume.candidate_name or '待确认'),
+        ('年龄', candidate_info.get('age') or '待确认'),
+        ('性别', candidate_info.get('gender') or '待确认'),
+        ('最高学历', candidate_info.get('education') or '待确认'),
+        ('毕业院校', candidate_info.get('school') or '待确认'),
+        ('专业', candidate_info.get('major') or '待确认'),
+        ('毕业年份', candidate_info.get('graduation_year') or '待确认'),
+        ('城市', candidate_info.get('city') or '待确认'),
+        ('工作年限', candidate_info.get('work_years') or '待确认'),
+        ('期望薪资', candidate_info.get('expected_salary') or '待确认'),
+        ('电话', resume.candidate_phone or candidate_info.get('phone') or '待确认'),
+        ('邮箱', resume.candidate_email or candidate_info.get('email') or '待确认'),
+    ])
+
+    _add_doc_heading(document, '三、核心亮点', level=1)
+    _add_bullets(document, highlights[:3], '暂无结构化亮点，建议查看完整报告。')
+
+    _add_doc_heading(document, '四、短板与风险', level=1)
+    _add_bullets(document, concerns[:3], '暂无明显短板，建议面试中继续验证。')
+
+    if requirement_matches:
+        _add_doc_heading(document, '五、JD匹配证据', level=1)
+        table = document.add_table(rows=1, cols=4)
+        table.style = 'Table Grid'
+        headers = ['招聘需求', '状态', '简历证据', '缺口/追问']
+        for i, header in enumerate(headers):
+            _set_cell_shading(table.rows[0].cells[i], 'DFF7FB')
+            _set_cell_text(table.rows[0].cells[i], header, bold=True, color=RGBColor(8, 89, 105))
+        for item in requirement_matches[:6]:
+            row = table.add_row().cells
+            _set_cell_text(row[0], item.get('requirement') or '')
+            _set_cell_text(row[1], _status_label(item.get('status')))
+            _set_cell_text(row[2], item.get('evidence') or '待确认')
+            _set_cell_text(row[3], item.get('gap') or '面试中补充确认')
+
+    _add_doc_heading(document, '六、建议面试问题', level=1)
+    for index, question in enumerate((questions or [])[:5], 1):
+        paragraph = document.add_paragraph(style='List Number')
+        run = paragraph.add_run(str(question))
+        _apply_run_font(run)
+
+    if evidence:
+        _add_doc_heading(document, '七、需人工复核证据', level=1)
+        for item in evidence[:5]:
+            if not isinstance(item, dict):
+                continue
+            p = document.add_paragraph()
+            r1 = p.add_run(f"{item.get('risk_label') or item.get('risk_type') or '风险'}：")
+            _apply_run_font(r1)
+            r1.bold = True
+            r1.font.color.rgb = RGBColor(180, 83, 9)
+            r2 = p.add_run(f"{item.get('finding') or ''}；原文：{item.get('evidence') or '待确认'}")
+            _apply_run_font(r2)
+
+    _add_doc_heading(document, '八、HR备注', level=1)
+    note = resume.hr_note or '暂无备注。'
+    p = document.add_paragraph()
+    r = p.add_run(note)
+    _apply_run_font(r)
+
+    footer = section.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer_run = footer.add_run('由 CVizr 自动生成 · AI 结果仅供 HR 与业务面试官辅助决策')
+    _apply_run_font(footer_run)
+    footer_run.font.size = Pt(8.5)
+    footer_run.font.color.rgb = RGBColor(148, 163, 184)
+
+    return document
 
 
 @app.route('/api/login', methods=['POST'])
@@ -261,6 +671,7 @@ def get_resumes():
     query = Resume.query
     if user.role != 'admin':
         query = query.filter_by(user_id=user.id)
+    _release_stale_evaluations(query)
     if status:
         query = query.filter_by(status=status)
 
@@ -283,20 +694,34 @@ def get_resume(id):
     resume = db.session.get(Resume, id)
     if not resume:
         return jsonify({'error': '简历不存在'}), 404
-    return jsonify(resume.to_dict())
+    payload = resume.to_dict()
+    fallback_info = _infer_candidate_basic_info(resume)
+    if fallback_info:
+        candidate_info = dict(payload.get('candidateBasicInfo') or {})
+        for key, value in fallback_info.items():
+            if value and not candidate_info.get(key):
+                candidate_info[key] = value
+        payload['candidateBasicInfo'] = candidate_info
+        payload['candidatePhone'] = payload.get('candidatePhone') or fallback_info.get('phone') or ''
+        payload['candidateEmail'] = payload.get('candidateEmail') or fallback_info.get('email') or ''
+    return jsonify(payload)
 
 
 @app.route('/api/resumes/<int:id>/status', methods=['GET'])
 def get_resume_status(id):
     err = _require_login()
     if err: return err
+    _release_stale_evaluations()
     resume = db.session.get(Resume, id)
     if not resume:
         return jsonify({'error': '简历不存在'}), 404
     return jsonify({
         'id': resume.id,
         'status': resume.status,
+        'stage': resume.evaluation_stage,
+        'progress': resume.evaluation_progress or 0,
         'error': resume.evaluation_error_message,
+        'message': resume.evaluation_status_message or ('评估任务排队或执行中。系统会限制并发，避免触发模型限流。' if resume.status == 'evaluating' else None),
         'updatedAt': resume.evaluation_time.isoformat() if resume.evaluation_time else None,
     })
 
@@ -310,7 +735,7 @@ def get_resume_evaluation(id):
         return jsonify({'error': '简历不存在'}), 404
     if not resume.evaluation_result:
         return jsonify({'error': '暂无评估结果'}), 404
-    return jsonify(resume.evaluation_result)
+    return jsonify(_enrich_evaluation_for_report(resume))
 
 
 @app.route('/api/resumes/<int:id>/download-report', methods=['GET'])
@@ -322,72 +747,27 @@ def download_report(id):
     if not resume:
         return jsonify({'error': '简历不存在'}), 404
 
-    # Prefer downloading the annotated document when available.
-    annotated = resume.annotated_document_url
-    if annotated and os.path.exists(annotated):
-        return send_file(annotated, as_attachment=True, download_name=os.path.basename(annotated))
+    if request.path.endswith('/download-annotated'):
+        annotated = resume.annotated_document_url
+        if annotated and os.path.exists(annotated):
+            return send_file(annotated, as_attachment=True, download_name=os.path.basename(annotated))
+        return jsonify({'error': '暂无批注文档'}), 404
 
-    # Fallback: generate a human-readable report text file from evaluation result.
     if not resume.evaluation_result:
         return jsonify({'error': '暂无可下载报告'}), 404
 
-    overall = (resume.evaluation_result or {}).get('overall_evaluation', {})
-    decision = _extract_decision_fields(resume.evaluation_result)
-    dims = (resume.evaluation_result or {}).get('dimension_evaluations', [])
-    dimension_labels = {
-        'basic_info': '基本信息完整性',
-        'format': '格式规范性',
-        'work_logic': '工作经历逻辑性',
-        'skill_match': '技能匹配度',
-        'risk_assessment': '风险评估',
-        'overall_impression': '综合印象',
-    }
-    if isinstance(dims, dict):
-        dims = [
-            {
-                **value,
-                'dimension': value.get('dimension') or dimension_labels.get(key, key),
-            }
-            for key, value in dims.items()
-            if isinstance(value, dict)
-        ]
-    lines = [
-        "HR简历评审报告",
-        f"候选人: {resume.candidate_name or '未命名'}",
-        f"简历ID: {resume.id}",
-        f"评审时间: {resume.evaluation_time.isoformat() if resume.evaluation_time else ''}",
-        "",
-        f"总分: {overall.get('overall_score', '')}",
-        f"等级: {overall.get('overall_grade', '')}",
-        f"岗位匹配分: {decision.get('matchScore') or ''}",
-        f"建议动作: {decision.get('recommendation') or ''}",
-        f"风险等级: {decision.get('riskLevel') or ''}",
-        f"综合反馈: {overall.get('overall_feedback', '')}",
-        "",
-        "候选人亮点:",
-        *[f"- {item}" for item in decision.get('highlights') or []],
-        "",
-        "主要短板/风险:",
-        *[f"- {item}" for item in decision.get('concerns') or []],
-        "",
-        "面试追问:",
-        *[f"- {item}" for item in decision.get('interviewQuestions') or []],
-        "",
-        "证据片段:",
-        *[f"- [{item.get('risk_type') or item.get('type') or '证据'}] {item.get('evidence', '')} -> {item.get('finding', '')}" for item in decision.get('evidenceSnippets') or [] if isinstance(item, dict)],
-        "",
-        "维度评分:",
-    ]
-    for d in dims:
-        lines.append(f"- {d.get('dimension', '')}: {d.get('score', '')} | {d.get('feedback', '')}")
-
     report_dir = os.path.join(STORAGE_PATH, 'exports')
     os.makedirs(report_dir, exist_ok=True)
-    filename = f"resume_report_{resume.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+    filename = f"CVizr_interview_brief_{resume.id}_{_safe_export_name(resume.candidate_name)}_{datetime.now().strftime('%Y%m%d%H%M%S')}.docx"
     filepath = os.path.join(report_dir, filename)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write("\n".join(lines))
-    return send_file(filepath, as_attachment=True, download_name=filename)
+    document = _build_interview_summary_docx(resume)
+    document.save(filepath)
+    return send_file(
+        filepath,
+        as_attachment=True,
+        download_name=filename,
+        mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    )
 
 
 @app.route('/api/upload', methods=['POST'])
@@ -420,6 +800,7 @@ def upload_resume():
 
     candidate_name = request.form.get('candidateName', '').strip() or os.path.splitext(file.filename)[0]
     profile_id = request.form.get('profileId', None, type=int)
+    job_name = request.form.get('jobName', '').strip()
     job_description = request.form.get('jobDescription', '').strip()
     auto_evaluate = request.form.get('autoEvaluate', 'false').lower() == 'true'
 
@@ -428,6 +809,7 @@ def upload_resume():
         candidate_name=candidate_name,
         resume_url=filepath,
         profile_id=profile_id,
+        job_name=job_name,
         job_description=job_description,
         workflow_status='new',
     )
@@ -451,6 +833,7 @@ def batch_upload():
         return jsonify({'error': '请上传文件'}), 400
 
     profile_id = request.form.get('profileId', None, type=int)
+    job_name = request.form.get('jobName', '').strip()
     job_description = request.form.get('jobDescription', '').strip()
     auto_evaluate = request.form.get('autoEvaluate', 'true').lower() != 'false'
     upload_dir = os.path.join(STORAGE_PATH, UPLOAD_FOLDER)
@@ -480,6 +863,7 @@ def batch_upload():
             candidate_name=os.path.splitext(file.filename)[0],
             resume_url=filepath,
             profile_id=profile_id,
+            job_name=job_name,
             job_description=job_description,
             workflow_status='new',
         )
@@ -505,16 +889,26 @@ def evaluate_resume(id):
     resume = db.session.get(Resume, id)
     if not resume:
         return jsonify({'error': '简历不存在'}), 404
-    if resume.status in ['evaluating', 'completed']:
+    if resume.status == 'evaluating':
         return jsonify({'error': f'简历状态为 {resume.status}，无法重复评审'}), 400
 
     data = request.json or {}
     if isinstance(data, dict) and data.get('jobDescription') is not None:
         resume.job_description = (data.get('jobDescription') or '').strip()
-        db.session.commit()
+    if isinstance(data, dict) and data.get('jobName') is not None:
+        resume.job_name = (data.get('jobName') or '').strip()
+    resume.status = 'pending'
+    resume.evaluation_stage = 'queued'
+    resume.evaluation_progress = 0
+    resume.evaluation_status_message = '任务已重新提交，正在等待评估资源'
+    resume.evaluation_error_message = None
+    resume.evaluation_task_token = None
+    resume.evaluation_result = None
+    resume.ai_result = None
+    db.session.commit()
     task_token = _start_evaluation_task(resume)
 
-    return jsonify({'status': 'evaluating', 'taskToken': task_token})
+    return jsonify({'status': 'evaluating', 'taskToken': task_token, 'resume': resume.to_dict_light()})
 
 
 @app.route('/api/resumes/<int:id>/workflow', methods=['PUT'])
@@ -844,7 +1238,7 @@ def export_scores():
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "简历评审评分表"
-    headers = ['序号', '候选人', '评审模板', '总分', '等级', '岗位匹配分', '建议动作', '风险等级', '处理状态', '核心亮点', '主要短板', 'HR备注', '评审时间', '风险数']
+    headers = ['序号', '候选人', 'JD任务名称', 'JD摘要', '评审模板', '综合评分', '综合等级', 'JD匹配分', 'JD匹配等级', '建议动作', '推荐原因', '关键缺口/淘汰原因', '风险等级', '处理状态', '核心亮点', '主要短板', 'HR备注', '评审时间', '风险数']
     ws.append(headers)
 
     for i, r in enumerate(resumes, 1):
@@ -853,11 +1247,16 @@ def export_scores():
         decision = _extract_decision_fields(result)
         ws.append([
             i, r.candidate_name or '',
+            r._job_display_name(),
+            r._job_summary(),
             r.profile.name if r.profile else '',
             overall.get('overall_score', ''),
             overall.get('overall_grade', ''),
             decision.get('matchScore') or '',
+            decision.get('matchGrade') or '',
             decision.get('recommendation') or '',
+            result.get('recommendation_reason') or '',
+            '；'.join((result.get('key_gaps') or []) + (result.get('knockout_reasons') or [])),
             decision.get('riskLevel') or '',
             r.workflow_status or 'new',
             '；'.join(decision.get('highlights') or []),
@@ -961,4 +1360,5 @@ def after_request(response):
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    debug = os.getenv('FLASK_DEBUG', '1').lower() in {'1', 'true', 'yes'}
+    app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=debug)

@@ -4,6 +4,9 @@ import json
 import re
 import sys
 import time
+import hashlib
+import threading
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from typing import Dict, Any, Optional, Type
 from dotenv import load_dotenv
@@ -14,7 +17,7 @@ from pydantic import ValidationError
 from datetime import datetime
 
 from .document_reader import get_document_reader
-from .llm_config import normalize_temperature
+from .llm_config import kimi_thinking_extra_body, normalize_temperature
 from .resume_structure import get_resume_structure_extractor, save_structure_debug
 from .token_counter import count_tokens, accumulate_model_tokens, extract_token_usage
 from . import resume_prompts
@@ -22,6 +25,36 @@ from task_control import TaskCancelledError, can_attach_log, ensure_task_active
 
 dotenv_path = os.path.join(os.path.dirname(__file__), '..', '.env')
 load_dotenv(dotenv_path=dotenv_path)
+
+_JD_CRITERIA_CACHE: Dict[str, Dict[str, Any]] = {}
+_JD_CRITERIA_LOCK = threading.RLock()
+
+
+def _fallback_jd_criteria(job_description: str = "") -> Dict[str, Any]:
+    """Create a deterministic screening ruler when no JD or model parsing is available."""
+    text = (job_description or "").strip()
+    if not text:
+        return {
+            "must_have_requirements": ["基本信息完整", "工作经历时间线清晰", "核心经历与目标岗位相关"],
+            "core_responsibilities": ["理解岗位职责并能用过往经历佐证", "具备稳定的职业路径和可验证成果"],
+            "nice_to_have": ["有量化业绩", "有与岗位高度相关的项目经验"],
+            "risk_watchpoints": ["关键信息缺失", "经历时间线不连续", "项目成果缺少证据"],
+            "interview_focus": ["请候选人说明与岗位最相关的项目贡献", "请候选人补充关键成果的数据依据"],
+        }
+
+    lines = [line.strip(" -•\t") for line in re.split(r"[\n；;。]+", text) if line.strip()]
+    keyword_lines = [line for line in lines if re.search(r"要求|必须|熟悉|具备|负责|优先|加分|经验|能力", line)]
+    selected = (keyword_lines or lines)[:12]
+    must = [line for line in selected if re.search(r"必须|要求|本科|以上|年|熟悉|具备|掌握", line)][:5]
+    core = [line for line in selected if re.search(r"负责|职责|推进|搭建|管理|完成|协作", line)][:5]
+    nice = [line for line in selected if re.search(r"优先|加分|更佳|熟悉.*优先", line)][:4]
+    return {
+        "must_have_requirements": must or selected[:4],
+        "core_responsibilities": core or selected[:4],
+        "nice_to_have": nice or ["有同类岗位成功案例", "成果可量化且可复盘"],
+        "risk_watchpoints": ["硬性要求未体现", "项目成果缺少数据", "经历与JD核心职责不一致", "薪资或稳定性需确认"],
+        "interview_focus": ["围绕JD硬性要求逐项追问证据", "确认候选人在关键项目中的个人贡献", "核验成果指标和业务影响"],
+    }
 
 
 class ResumeEvaluator:
@@ -52,19 +85,18 @@ class ResumeEvaluator:
             raise ValueError("未找到可用的LLM模型配置")
 
         self.request_timeout = int(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
-        # Kimi K2.6 may spend part of the completion budget on reasoning tokens
-        # before emitting the final JSON, so the default must leave enough room.
-        self.response_max_tokens = int(os.getenv("LLM_RESPONSE_MAX_TOKENS", "2400"))
+        self.response_max_tokens = int(os.getenv("LLM_RESPONSE_MAX_TOKENS", "2200"))
 
         llm_kwargs = {}
-        if self.enable_thinking:
-            llm_kwargs['model_kwargs'] = {"extra_body": {"enable_thinking": True}}
+        extra_body = kimi_thinking_extra_body(self.model_name, self.enable_thinking)
+        if extra_body:
+            llm_kwargs['model_kwargs'] = {"extra_body": extra_body}
 
         self.llm = ChatOpenAI(
             model_name=self.model_name,
             openai_api_key=self.api_key,
             openai_api_base=self.api_base,
-            temperature=normalize_temperature(self.model_name, 0.5),
+            temperature=normalize_temperature(self.model_name, 0.5, self.enable_thinking),
             timeout=self.request_timeout,
             max_tokens=self.response_max_tokens,
             **llm_kwargs,
@@ -75,7 +107,7 @@ class ResumeEvaluator:
                 model_name=self.model_name,
                 openai_api_key=self.api_key,
                 openai_api_base=self.api_base,
-                temperature=normalize_temperature(self.model_name, 0.5),
+                temperature=normalize_temperature(self.model_name, 0.5, self.enable_thinking),
                 timeout=self.request_timeout,
                 max_tokens=self.response_max_tokens,
             )
@@ -200,21 +232,41 @@ class ResumeEvaluator:
 
         raise ValueError(f"{label} 在 {max_attempts} 次尝试后仍未返回有效JSON: {last_error}")
 
-    def _invoke_llm_text(self, prompt_text: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+    def _invoke_llm_text(self, prompt_text: str, max_tokens: Optional[int] = None, model_name: Optional[str] = None) -> Dict[str, Any]:
         completion_limit = max_tokens or self.response_max_tokens
-        if (self.model_name or "").lower().startswith("kimi-"):
+        request_model = model_name or self.model_name
+        if (request_model or "").lower().startswith("kimi-"):
             client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base,
                 timeout=self.request_timeout,
                 max_retries=1,
             )
-            completion = client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt_text}],
-                temperature=normalize_temperature(self.model_name, 0.5),
-                max_tokens=completion_limit,
-            )
+            extra_body = kimi_thinking_extra_body(request_model, self.enable_thinking)
+            max_attempts = int(os.getenv("KIMI_API_MAX_RETRIES", "2"))
+            completion = None
+            for attempt in range(max_attempts + 1):
+                try:
+                    request_kwargs = {
+                        "model": request_model,
+                        "messages": [{"role": "user", "content": prompt_text}],
+                        "temperature": normalize_temperature(request_model, 0.5, self.enable_thinking),
+                        "max_tokens": completion_limit,
+                    }
+                    if extra_body:
+                        request_kwargs["extra_body"] = extra_body
+                    completion = client.chat.completions.create(
+                        **request_kwargs,
+                    )
+                    break
+                except Exception as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    retryable = status_code in {408, 409, 429, 500, 502, 503, 504} or status_code is None
+                    if attempt >= max_attempts or not retryable:
+                        raise
+                    sleep_seconds = min(12, (2 ** attempt) + random.uniform(0.2, 1.2))
+                    print(f"   [WARNING] Kimi请求失败(status={status_code})，{sleep_seconds:.1f}s后重试: {exc}")
+                    time.sleep(sleep_seconds)
             text = completion.choices[0].message.content or ""
             usage = completion.usage
             return {
@@ -273,6 +325,130 @@ class ResumeEvaluator:
             })
         return normalized
 
+    def _normalize_jd_criteria(self, value, job_description: str = ""):
+        fallback = _fallback_jd_criteria(job_description)
+        if not isinstance(value, dict):
+            return fallback
+        return {
+            "must_have_requirements": self._normalize_list(value.get("must_have_requirements"), fallback["must_have_requirements"])[:8],
+            "core_responsibilities": self._normalize_list(value.get("core_responsibilities"), fallback["core_responsibilities"])[:8],
+            "nice_to_have": self._normalize_list(value.get("nice_to_have"), fallback["nice_to_have"])[:6],
+            "risk_watchpoints": self._normalize_list(value.get("risk_watchpoints"), fallback["risk_watchpoints"])[:6],
+            "interview_focus": self._normalize_list(value.get("interview_focus"), fallback["interview_focus"])[:6],
+        }
+
+    def _normalize_requirement_matches(self, value):
+        if not isinstance(value, list):
+            return []
+        normalized = []
+        for item in value[:8]:
+            if isinstance(item, str):
+                normalized.append({
+                    "requirement": item[:80],
+                    "status": "unknown",
+                    "evidence": "",
+                    "gap": "需面试确认",
+                })
+                continue
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status") or "unknown"
+            if status not in {"met", "partial", "missing", "unknown"}:
+                status = "unknown"
+            normalized.append({
+                "requirement": str(item.get("requirement") or item.get("name") or "")[:100],
+                "status": status,
+                "evidence": str(item.get("evidence") or item.get("quote") or "")[:180],
+                "gap": str(item.get("gap") or item.get("concern") or "")[:160],
+            })
+        return [item for item in normalized if item["requirement"]]
+
+    def _normalize_score_breakdown(self, value):
+        fallback = {"jd_match": 0, "resume_quality": 0, "risk_control": 0, "evidence_confidence": 0}
+        if not isinstance(value, dict):
+            return fallback
+        normalized = {}
+        for key in fallback:
+            try:
+                normalized[key] = max(0, min(100, int(round(float(value.get(key, 0))))))
+            except (TypeError, ValueError):
+                normalized[key] = 0
+        return normalized
+
+    def _normalize_candidate_basic_info(self, value):
+        if not isinstance(value, dict):
+            return {}
+        fields = [
+            "age",
+            "gender",
+            "education",
+            "school",
+            "major",
+            "graduation_year",
+            "city",
+            "work_years",
+            "expected_salary",
+        ]
+        normalized = {}
+        for field in fields:
+            text = str(value.get(field) or "").strip()
+            normalized[field] = text[:80] if text else ""
+        return normalized
+
+    def _normalize_dimension_evidence(self, value):
+        if not isinstance(value, list):
+            return []
+        normalized = []
+        for item in value[:4]:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    normalized.append({"summary": "简历原文证据", "evidence": text[:260]})
+                continue
+            if not isinstance(item, dict):
+                continue
+            evidence = str(item.get("evidence") or item.get("quote") or item.get("original_text") or "").strip()
+            if not evidence:
+                continue
+            normalized.append({
+                "summary": str(item.get("summary") or item.get("point") or item.get("claim") or "简历原文证据").strip()[:80],
+                "evidence": evidence[:260],
+            })
+        return normalized
+
+    def _fallback_dimension_evidence(self, resume_content: str, dimension_key: str, dimension_payload: Optional[Dict[str, Any]] = None):
+        lines = [
+            line.strip(" -•\t")
+            for line in re.split(r"[\n\r]+", resume_content or "")
+            if len(line.strip()) >= 6
+        ]
+        lines = [
+            line for line in lines
+            if "模拟测试数据" not in line and "以下姓名、经历、联系方式均为虚构" not in line
+        ]
+        keyword_map = {
+            "basic_info": r"姓名|性别|年龄|城市|手机|电话|邮箱|院校|学历|专业|毕业|薪资",
+            "format": r"基本信息|个人摘要|核心技能|工作|实习|项目|教育|经历|补充说明",
+            "work_logic": r"工作|实习|经历|负责|项目|20\d{2}|至今|公司|团队|部门",
+            "skill_match": r"技能|能力|工具|Python|SQL|Java|前端|后端|AI|AIGC|Prompt|RAG|产品|运营|设计|数据|剪辑|小红书",
+            "risk_assessment": r"风险|待确认|补充说明|毕业时间|期望薪资|未体现|不符|缺少|疑似|模拟风险",
+            "overall_impression": r"个人摘要|核心技能|工作|实习|项目|负责|成果|获得|排名|优化|提升",
+        }
+        pattern = keyword_map.get(dimension_key, keyword_map["overall_impression"])
+        matched = [line for line in lines if re.search(pattern, line, re.IGNORECASE)]
+        selected = (matched or lines)[:3]
+
+        payload = dimension_payload or {}
+        summary_source = payload.get("strengths") or payload.get("weaknesses") or payload.get("feedback") or "维度判断"
+        summary = re.split(r"[。；;\n]", str(summary_source).strip())[0][:80] or "维度判断"
+        return [
+            {
+                "summary": summary,
+                "evidence": line[:260],
+            }
+            for line in selected
+        ]
+
     def _normalize_decision_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         overall = payload.get("overall_evaluation") or {}
         match_score = payload.get("match_score", overall.get("overall_score", 0))
@@ -299,15 +475,77 @@ class ResumeEvaluator:
             risk_level = "medium"
 
         payload["match_score"] = match_score
+        payload["match_grade"] = self._get_letter_grade(match_score)
         payload["recommendation"] = recommendation
         payload["risk_level"] = risk_level
         payload["highlights"] = self._normalize_list(payload.get("highlights"), ["暂无明确亮点"])
         payload["concerns"] = self._normalize_list(payload.get("concerns"), ["暂无明确短板"])
         payload["interview_questions"] = self._normalize_list(payload.get("interview_questions"), ["请候选人补充说明简历中的关键经历"],)[:5]
         payload["evidence_snippets"] = self._normalize_evidence(payload.get("evidence_snippets"))
+        payload["requirement_matches"] = self._normalize_requirement_matches(payload.get("requirement_matches"))
+        payload["score_breakdown"] = self._normalize_score_breakdown(payload.get("score_breakdown"))
+        payload["recommendation_reason"] = str(payload.get("recommendation_reason") or "建议结合JD匹配度、风险证据和面试追问做最终判断。")[:240]
+        payload["key_gaps"] = self._normalize_list(payload.get("key_gaps"), [])[:5]
+        payload["candidate_profile_summary"] = str(payload.get("candidate_profile_summary") or "")[:240]
+        payload["candidate_basic_info"] = self._normalize_candidate_basic_info(payload.get("candidate_basic_info"))
+        payload["knockout_reasons"] = self._normalize_list(payload.get("knockout_reasons"), [])[:5]
+        templates = payload.get("communication_templates") if isinstance(payload.get("communication_templates"), dict) else {}
+        payload["communication_templates"] = {
+            "interview_invite": str(templates.get("interview_invite") or "您好，我们看到了您的简历，想进一步沟通岗位匹配情况，请问近期方便安排一次面试吗？")[:300],
+            "request_more_info": str(templates.get("request_more_info") or "您好，为了更准确评估岗位匹配度，麻烦补充相关项目经历、可到岗时间或作品链接。")[:300],
+            "rejection": str(templates.get("rejection") or "您好，感谢投递。综合当前岗位要求，本次暂不进入下一轮，后续有合适机会我们会再联系。")[:300],
+        }
         return payload
 
-    def _evaluate_resume_single_pass(self, resume_content: str, job_description: str = "") -> tuple:
+    def parse_jd_criteria(self, job_description: str = "") -> Dict[str, Any]:
+        jd = (job_description or "").strip()
+        if not jd:
+            return _fallback_jd_criteria("")
+
+        cache_key = hashlib.sha256(jd.encode("utf-8")).hexdigest()
+        with _JD_CRITERIA_LOCK:
+            if cache_key in _JD_CRITERIA_CACHE:
+                return _JD_CRITERIA_CACHE[cache_key]
+
+            prompt_text = f"""你是一位资深招聘负责人。请把下面这份JD拆成可执行的初筛尺子，帮助HR批量筛简历。
+
+JD:
+---
+{jd[:6000]}
+---
+
+只输出JSON对象，不要输出Markdown。JSON结构如下:
+{{
+  "must_have_requirements": ["硬性要求，4-8条"],
+  "core_responsibilities": ["核心职责，3-6条"],
+  "nice_to_have": ["加分项，2-5条"],
+  "risk_watchpoints": ["筛选时要警惕的风险，3-6条"],
+  "interview_focus": ["面试重点追问方向，3-6条"]
+}}
+
+要求:
+- 硬性要求只能包含JD明确表达的必要条件，不要擅自拔高。
+- 加分项不能当成淘汰条件。
+- 每条不超过35字，语言要像HR筛选清单。
+"""
+            try:
+                jd_model = os.getenv("KIMI_JD_MODEL_NAME", "kimi-k2-turbo-preview")
+                response = self._invoke_llm_text(
+                    prompt_text,
+                    max_tokens=int(os.getenv("KIMI_JD_PARSE_MAX_TOKENS", "1000")),
+                    model_name=jd_model,
+                )
+                accumulate_model_tokens(response["input_tokens"], response["output_tokens"])
+                payload = self._extract_json_payload(response["text"])
+                criteria = self._normalize_jd_criteria(payload, jd)
+            except Exception as exc:
+                print(f"   [WARNING] JD筛选尺子解析失败，已使用规则兜底: {exc}")
+                criteria = _fallback_jd_criteria(jd)
+
+            _JD_CRITERIA_CACHE[cache_key] = criteria
+            return criteria
+
+    def _evaluate_resume_single_pass(self, resume_content: str, job_description: str = "", jd_criteria: Optional[Dict[str, Any]] = None) -> tuple:
         criteria = self.criteria_data["evaluation_criteria"]
         compact_criteria = {
             key: {
@@ -318,15 +556,19 @@ class ResumeEvaluator:
             for key, value in criteria.items()
         }
         jd_block = job_description.strip() or "未提供JD。请按岗位模板和通用中小企业初筛标准评估。"
+        screening_ruler = self._normalize_jd_criteria(jd_criteria, job_description)
         prompt_text = f"""你是一位资深HR简历审查专家。请基于当前日期 {datetime.now().strftime('%Y-%m-%d')} 审查这份求职简历。
 产品目标：帮助中小企业HR在5分钟内完成批量初筛、风险识别、候选人排序和面试建议。
 
-岗位JD/需求:
+本次岗位JD/招聘需求（最高优先级）:
 ---
 {jd_block[:6000]}
 ---
 
-评审维度JSON:
+本次岗位筛选尺子JSON（请作为主要评分依据）:
+{json.dumps(screening_ruler, ensure_ascii=False)}
+
+通用评审维度JSON（仅作为补充框架；有JD时不得覆盖JD要求）:
 {json.dumps(compact_criteria, ensure_ascii=False)}
 
 简历全文:
@@ -337,21 +579,46 @@ class ResumeEvaluator:
 只输出一个JSON对象，不要输出Markdown代码块或解释。JSON结构必须完全如下:
 {{
   "match_score": 0,
+  "match_grade": "A/B/C/D/E",
   "recommendation": "推荐面试/待定/建议淘汰/建议人工复核",
   "risk_level": "low/medium/high",
   "highlights": ["3个候选人亮点，每条不超过35字"],
   "concerns": ["3个主要短板或风险，每条不超过35字"],
+  "recommendation_reason": "为什么给出该建议动作，80字以内",
+  "candidate_profile_summary": "候选人画像摘要，80字以内",
+  "candidate_basic_info": {{
+    "age": "年龄，如简历未写则空字符串",
+    "gender": "性别，如简历未写则空字符串",
+    "education": "最高学历，如本科/硕士",
+    "school": "毕业院校",
+    "major": "专业",
+    "graduation_year": "毕业年份/届别",
+    "city": "所在城市或期望城市",
+    "work_years": "工作年限/实习年限",
+    "expected_salary": "期望薪资，如简历未写则空字符串"
+  }},
+  "key_gaps": ["候选人与JD的关键缺口，最多5条"],
+  "knockout_reasons": ["如建议淘汰或复核，列出硬性不符/高风险原因，最多5条"],
+  "score_breakdown": {{"jd_match": 0, "resume_quality": 0, "risk_control": 0, "evidence_confidence": 0}},
+  "requirement_matches": [
+    {{"requirement": "硬性要求", "status": "met/partial/missing/unknown", "evidence": "简历原文证据", "gap": "缺口或待确认点"}}
+  ],
   "interview_questions": ["5个建议面试追问"],
+  "communication_templates": {{
+    "interview_invite": "约面邀请话术",
+    "request_more_info": "补充材料请求话术",
+    "rejection": "婉拒话术"
+  }},
   "evidence_snippets": [
     {{"risk_type": "timeline/missing_info/credential/exaggeration/aigc/salary", "risk_label": "时间线矛盾/信息缺失/证书或学历疑点/夸大表述/AI痕迹/薪资预期不合理", "evidence": "简历原文短句", "finding": "基于原文的判断"}}
   ],
   "dimension_evaluations": {{
-    "basic_info": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
-    "format": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
-    "work_logic": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
-    "skill_match": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
-    "risk_assessment": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}},
-    "overall_impression": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "..."}}
+    "basic_info": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "...", "evidence_quotes": [{{"summary": "支持上面判断的总结语句", "evidence": "简历原文短句"}}]}},
+    "format": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "...", "evidence_quotes": [{{"summary": "支持上面判断的总结语句", "evidence": "简历原文短句"}}]}},
+    "work_logic": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "...", "evidence_quotes": [{{"summary": "支持上面判断的总结语句", "evidence": "简历原文短句"}}]}},
+    "skill_match": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "...", "evidence_quotes": [{{"summary": "支持上面判断的总结语句", "evidence": "简历原文短句"}}]}},
+    "risk_assessment": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "...", "evidence_quotes": [{{"summary": "支持上面判断的总结语句", "evidence": "简历原文短句"}}]}},
+    "overall_impression": {{"score": 0, "feedback": "...", "strengths": "...", "weaknesses": "...", "evidence_quotes": [{{"summary": "支持上面判断的总结语句", "evidence": "简历原文短句"}}]}}
   }},
   "overall_evaluation": {{
     "overall_score": 0,
@@ -362,13 +629,28 @@ class ResumeEvaluator:
 }}
 
 重要规则:
+- 筛选优先级：本次岗位JD > 简历原文证据 > 通用评审维度/岗位模板。
+- 如果提供了JD，必须先提炼JD中的硬性要求、核心职责、加分项和风险点，再判断候选人与这些要求的匹配程度。
+- match_score 是“候选人与当前JD需求的接近程度”，越高表示越贴近JD；不要把简历写作质量、排版美观度当成主因。
+- match_grade 必须由 match_score 决定：A=90-100，B=80-89，C=70-79，D=60-69，E=0-59。
+- overall_evaluation.overall_score 是候选人综合实力分，综合考虑JD匹配、经历含金量、技能深度、风险可控、表达质量和成长潜力。
+- overall_evaluation.overall_grade 必须由 overall_score 决定，用于HR按“综合实力”视角排序。
+- 有JD时，match_score必须主要体现JD匹配度，而不是通用简历质量分；highlights、concerns、interview_questions也必须围绕JD展开。
+- requirement_matches 必须覆盖筛选尺子中的硬性要求；缺少原文证据时 status 用 missing 或 unknown。
+- score_breakdown 中 jd_match 是岗位匹配，resume_quality 是简历质量，risk_control 是风险可控程度，evidence_confidence 是证据充分度。
+- recommendation_reason 必须能回答业务方“为什么推荐/为什么复核”。
+- communication_templates 必须简洁礼貌，便于HR复制给候选人。
+- candidate_basic_info 只能填写简历原文可推断的信息；年龄、性别等未写就留空，不要猜。
+- 不得因为性别、年龄等敏感项自动淘汰候选人；这些仅作为HR人工辅助查看信息。
+- 无JD时，才按岗位模板和通用中小企业初筛标准评估。
 - 如果风险等级为high，不要直接给“建议淘汰”，优先给“建议人工复核”。
 - 每个evidence_snippets必须引用简历原文短句，不能只有结论。
-- 如果提供了JD，match_score必须体现JD匹配度，而不是通用简历质量分。
+- 每个dimension_evaluations.*.evidence_quotes 必须引用简历原文，用来支撑该维度的 strengths/weaknesses/feedback，不要写模型解释。
+- 不要因为候选人未覆盖JD中的“加分项”就直接淘汰；硬性要求缺失、关键经验不符或高风险证据才影响推荐动作。
 """
         response = self._invoke_llm_text(
             prompt_text,
-            max_tokens=int(os.getenv("KIMI_SINGLE_PASS_MAX_TOKENS", "5000")),
+            max_tokens=int(os.getenv("KIMI_SINGLE_PASS_MAX_TOKENS", "3200")),
         )
         raw_text = response["text"]
         input_tokens = response["input_tokens"]
@@ -385,6 +667,10 @@ class ResumeEvaluator:
                 resume_prompts.DimensionEvaluation,
                 raw_dimension,
             )
+            dimension_evidence = self._normalize_dimension_evidence(raw_dimension.get("evidence_quotes"))
+            if not dimension_evidence:
+                dimension_evidence = self._fallback_dimension_evidence(resume_content, key, raw_dimension)
+            dimension_evals[key]["evidence_quotes"] = dimension_evidence
 
         overall_eval = self._validate_payload(
             resume_prompts.OverallEvaluation,
@@ -396,10 +682,18 @@ class ResumeEvaluator:
 
         return {
             "match_score": payload["match_score"],
+            "match_grade": payload["match_grade"],
             "recommendation": payload["recommendation"],
             "risk_level": payload["risk_level"],
             "highlights": payload["highlights"][:3],
             "concerns": payload["concerns"][:3],
+            "jd_criteria": screening_ruler,
+            "requirement_matches": payload["requirement_matches"],
+            "score_breakdown": payload["score_breakdown"],
+            "recommendation_reason": payload["recommendation_reason"],
+            "candidate_profile_summary": payload["candidate_profile_summary"],
+            "candidate_basic_info": payload["candidate_basic_info"],
+            "key_gaps": payload["key_gaps"],
             "interview_questions": payload["interview_questions"][:5],
             "evidence_snippets": payload["evidence_snippets"],
             "dimension_evaluations": dimension_evals,
@@ -519,7 +813,7 @@ class ResumeEvaluator:
                 "recommendations": ["请重点关注各维度中标注的不足之处"]
             }, 0
 
-    def evaluate_resume(self, resume_path: str, job_description: str = "", cancel_check=None) -> Dict[str, Any]:
+    def evaluate_resume(self, resume_path: str, job_description: str = "", cancel_check=None, progress_callback=None) -> Dict[str, Any]:
         print("\n" + "="*50)
         print(f"== 开始审查简历: {os.path.basename(resume_path)}")
         print(f"== 使用岗位模板: {self.position_type}")
@@ -528,7 +822,20 @@ class ResumeEvaluator:
 
         if cancel_check: cancel_check()
 
-        print("\n[步骤 1/4] 读取并解析简历...")
+        if progress_callback:
+            if job_description:
+                progress_callback('parsing_jd', 18, '正在分析JD需求，生成本次岗位筛选尺子')
+            else:
+                progress_callback('preparing_criteria', 18, '未填写JD，正在准备通用初筛标准')
+        jd_criteria = self.parse_jd_criteria(job_description)
+        if job_description:
+            print("\n[步骤 1/4] 已生成本次岗位筛选尺子。")
+
+        if cancel_check: cancel_check()
+
+        if progress_callback:
+            progress_callback('reading_resume', 34, '正在读取并解析候选人简历')
+        print("\n[步骤 2/4] 读取并解析简历...")
         try:
             structure = self.structure_extractor.extract(resume_path)
             body_texts = [
@@ -550,10 +857,14 @@ class ResumeEvaluator:
         if cancel_check: cancel_check()
 
         if (self.model_name or "").lower().startswith("kimi-"):
-            print("\n[步骤 2/4] Kimi K2.6 使用单次紧凑评审...")
+            print("\n[步骤 3/4] Kimi 使用单次紧凑评审...")
             try:
-                result_json, total_tokens = self._evaluate_resume_single_pass(resume_content, job_description)
+                if progress_callback:
+                    progress_callback('matching', 56, '正在进行JD匹配评分和候选人初筛评估')
+                result_json, total_tokens = self._evaluate_resume_single_pass(resume_content, job_description, jd_criteria)
                 overall_eval = result_json["overall_evaluation"]
+                if progress_callback:
+                    progress_callback('structuring_result', 88, '正在整理推荐结果、风险证据和面试问题')
                 print(f"   ...完成。(总分: {overall_eval['overall_score']})")
                 end_time = time.time()
                 print(f"\n== AI审查完成，耗时: {end_time - start_time:.2f}s，Token: {total_tokens}")
@@ -562,7 +873,9 @@ class ResumeEvaluator:
                 print(f"   [WARNING] Kimi 单次评审失败，回退到分维度审查: {exc}")
                 if cancel_check: cancel_check()
 
-        print("\n[步骤 2/4] 开始分维度审查（并行）...")
+        print("\n[步骤 3/4] 开始分维度审查（并行）...")
+        if progress_callback:
+            progress_callback('scoring_dimensions', 56, '正在按JD和通用维度评估候选人质量')
         dimension_evals = {}
         total_tokens = 0
         criteria = self.criteria_data["evaluation_criteria"]
@@ -580,6 +893,7 @@ class ResumeEvaluator:
                     "weaknesses": "自动审查未完成",
                 }
                 tokens = 0
+            result["evidence_quotes"] = self._fallback_dimension_evidence(resume_content, key, result)
             return key, result, tokens
 
         max_workers = min(len(criteria), int(os.getenv("EVALUATION_MAX_WORKERS", "1")))
@@ -593,6 +907,9 @@ class ResumeEvaluator:
                 dimension_evals[key] = result
                 total_tokens += tokens
                 print(f"   ✓ {criteria[key]['description']} (得分: {result['score']})")
+                if progress_callback:
+                    done = len(dimension_evals)
+                    progress_callback('scoring_dimensions', min(78, 56 + int(done / max(1, len(criteria)) * 22)), f'正在评估维度 {done}/{len(criteria)}')
         except TimeoutError:
             print(f"   [WARNING] 分维度审查超过 {dimension_timeout}s，未完成维度已标记为人工复核。")
             for future, key in futures.items():
@@ -608,13 +925,16 @@ class ResumeEvaluator:
                     "strengths": "待人工复核",
                     "weaknesses": "自动审查超时",
                 }
+                dimension_evals[key]["evidence_quotes"] = self._fallback_dimension_evidence(resume_content, key, dimension_evals[key])
         except TaskCancelledError:
             executor.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
             executor.shutdown(wait=False)
 
-        print("\n[步骤 3/4] 生成综合评价...")
+        print("\n[步骤 4/4] 生成综合评价...")
+        if progress_callback:
+            progress_callback('structuring_result', 86, '正在整理推荐结果和推荐动作')
         if cancel_check: cancel_check()
         overall_eval, overall_tokens = self._generate_overall_evaluation(dimension_evals)
         total_tokens += overall_tokens
@@ -628,6 +948,16 @@ class ResumeEvaluator:
             "risk_level": "high" if any(v.get("score", 100) < 55 for v in dimension_evals.values()) else "medium",
             "highlights": [v.get("strengths", "") for v in dimension_evals.values() if v.get("strengths")][:3],
             "concerns": [v.get("weaknesses", "") for v in dimension_evals.values() if v.get("weaknesses")][:3],
+            "jd_criteria": jd_criteria,
+            "requirement_matches": [],
+            "score_breakdown": {
+                "jd_match": overall_eval.get("overall_score", 0),
+                "resume_quality": overall_eval.get("overall_score", 0),
+                "risk_control": 60,
+                "evidence_confidence": 60,
+            },
+            "recommendation_reason": "已按通用维度完成初筛；建议结合JD要求在面试中补充确认。",
+            "key_gaps": [],
             "interview_questions": ["请候选人解释简历中最核心项目的个人贡献", "请候选人补充与岗位JD最匹配的案例"],
             "evidence_snippets": [],
             "overall_evaluation": overall_eval,
@@ -670,6 +1000,14 @@ def run_evaluation_in_background(app, db, resume_id: int, task_token: str):
         try:
             ensure_task_active(db.session, resume, 'evaluation', task_token)
 
+            def update_progress(stage: str, progress: int, message: str):
+                ensure_task_active(db.session, resume, 'evaluation', task_token)
+                resume.evaluation_stage = stage
+                resume.evaluation_progress = max(0, min(99, int(progress)))
+                resume.evaluation_status_message = message[:300]
+                db.session.commit()
+
+            update_progress('starting', 10, '评估任务已开始，正在准备岗位需求分析')
             profile, profile_config = resolve_profile_for_resume(db.session, resume)
             print(f"[后台任务] 使用模板: {profile.name} ({profile.position_type})")
 
@@ -677,13 +1015,17 @@ def run_evaluation_in_background(app, db, resume_id: int, task_token: str):
             result_json, total_tokens = evaluator.evaluate_resume(
                 resume.resume_url,
                 job_description=resume.job_description or "",
-                cancel_check=lambda: ensure_task_active(db.session, resume, 'evaluation', task_token)
+                cancel_check=lambda: ensure_task_active(db.session, resume, 'evaluation', task_token),
+                progress_callback=update_progress,
             )
 
             ensure_task_active(db.session, resume, 'evaluation', task_token)
 
             resume.status = 'completed'
-            resume.ai_result = result_json.get("overall_evaluation", {}).get("overall_grade", "N/A")
+            resume.evaluation_stage = 'completed'
+            resume.evaluation_progress = 100
+            resume.evaluation_status_message = '评估完成，已生成候选人推荐和面试建议'
+            resume.ai_result = result_json.get("match_grade") or result_json.get("overall_evaluation", {}).get("overall_grade", "N/A")
             resume.evaluation_result = result_json
             resume.evaluation_time = datetime.utcnow()
             resume.tokens_used = (resume.tokens_used or 0) + total_tokens
@@ -709,6 +1051,9 @@ def run_evaluation_in_background(app, db, resume_id: int, task_token: str):
             from .document_reader import classify_file_error
             friendly_msg = classify_file_error(e)
             resume.status = 'failed'
+            resume.evaluation_stage = 'failed'
+            resume.evaluation_progress = 100
+            resume.evaluation_status_message = friendly_msg
             resume.workflow_status = 'needs_review'
             resume.evaluation_error_message = friendly_msg
             resume.evaluation_task_token = None
