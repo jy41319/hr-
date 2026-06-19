@@ -147,17 +147,13 @@ HR 可以对 AI 推荐结果进行反馈，例如：
 
 ![AI 问答助手](screenshots/ui/01_chat.png)
 
-### 简历初筛
 
-![简历初筛](screenshots/ui/02_single_review.png)
 
 ### 候选人决策看板
 
 ![候选人决策看板](screenshots/ui/03_batch_dashboard.png)
 
-### 初筛报告
 
-![初筛报告](screenshots/ui/04_report.png)
 
 ### 模型管理
 
